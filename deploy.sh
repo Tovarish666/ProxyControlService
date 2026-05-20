@@ -186,15 +186,12 @@ hdr "3/8 Запуск VM"
 qm start "$VM_ID"
 ok "VM запущена, ожидаем guest agent..."
 
-# Ждём agent; если не появился — ставим через qm terminal + expect
-elapsed=0; echo -n "  "
-while ! qm guest cmd "$VM_ID" network-get-interfaces &>/dev/null 2>&1; do
-    sleep 5; elapsed=$((elapsed+5)); echo -n "."
-    if [[ $elapsed -eq 90 ]]; then
-        echo ""
-        warn "Guest agent не отвечает — устанавливаем через qm terminal..."
-        apt install -y -qq expect 2>/dev/null || true
-        expect -f - <<EXPECT
+step "Ждём загрузки VM (30с)..."
+sleep 30
+
+step "Устанавливаем qemu-guest-agent через qm terminal..."
+apt install -y -qq expect 2>/dev/null || true
+expect -f - <<EXPECT
 set timeout 120
 spawn qm terminal $VM_ID
 expect "login:"    { send "root\r" }
@@ -202,9 +199,13 @@ expect "Password:" { send "${VM_PASSWORD}\r" }
 expect "#"         { send "apt install -y -qq qemu-guest-agent && systemctl enable --now qemu-guest-agent\r" }
 expect "#"         { send "\x1d" }
 EXPECT
-        sleep 15; echo -n "  "
-    fi
-    [[ $elapsed -ge 240 ]] && { echo ""; fail "VM не загрузилась за 4 мин. Проверь: qm terminal ${VM_ID}"; }
+ok "qemu-guest-agent установлен"
+
+step "Ждём guest agent..."
+elapsed=0; echo -n "  "
+while ! qm guest cmd "$VM_ID" network-get-interfaces &>/dev/null 2>&1; do
+    sleep 5; elapsed=$((elapsed+5)); echo -n "."
+    [[ $elapsed -ge 60 ]] && { echo ""; fail "Guest agent не поднялся. Проверь: qm terminal ${VM_ID}"; }
 done
 echo ""
 
