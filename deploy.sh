@@ -43,6 +43,9 @@ command -v pvesm &>/dev/null   || fail "pvesm не найден"
 # ════════════════════════════════════════════════════════════
 #  Q&A
 # ════════════════════════════════════════════════════════════
+# Переключаем stdin на терминал (нужно при запуске через bash <(curl ...))
+exec </dev/tty
+
 echo -e "\n${B}  ProxyVethMP — Деплой новой VM${R}"
 echo -e "  ${D}github.com/Tovarish666/ProxyVeth${R}\n"
 
