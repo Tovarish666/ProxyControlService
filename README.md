@@ -66,7 +66,7 @@
 На хосте Proxmox:
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVeth/main/deploy.sh)
+bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main/deploy.sh)
 ```
 
 Скрипт задаст вопросы и за ~20 минут:
@@ -107,7 +107,7 @@ reboot
 
 ```bash
 wget -O /usr/local/bin/proxyveth_mp.py \
-  https://raw.githubusercontent.com/Tovarish666/ProxyVeth/main/proxyveth_mp.py
+  https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main/proxyveth_mp.py
 chmod +x /usr/local/bin/proxyveth_mp.py
 ln -sf /usr/local/bin/proxyveth_mp.py /usr/local/bin/proxyveth
 

@@ -1,16 +1,16 @@
 #!/bin/bash
 # =============================================================
 #  deploy.sh — ProxyVethMP полный деплой
-#  Репозиторий: https://github.com/Tovarish666/ProxyVeth
+#  Репозиторий: https://github.com/Tovarish666/ProxyVethMP
 #
 #  Запуск на хосте Proxmox:
-#    bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVeth/main/deploy.sh)
+#    bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main/deploy.sh)
 #
 #  Время: ~20 минут
 # =============================================================
 set -euo pipefail
 
-GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyVeth/main"
+GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main"
 PROXYVETHMP_URL="${GITHUB_RAW}/proxyveth_mp.py"
 UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 UBUNTU_IMG_PATH="/var/lib/vz/template/iso/ubuntu-24.04.img"
