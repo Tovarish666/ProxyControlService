@@ -194,6 +194,8 @@ apt install -y -qq expect 2>/dev/null || true
 expect -f - <<EXPECT
 set timeout 120
 spawn qm terminal $VM_ID
+sleep 3
+send "\r"
 expect "login:"    { send "root\r" }
 expect "Password:" { send "${VM_PASSWORD}\r" }
 expect "#"         { send "apt install -y -qq qemu-guest-agent && systemctl enable --now qemu-guest-agent\r" }
