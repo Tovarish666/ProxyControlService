@@ -99,7 +99,7 @@ list_vms() {
     local -A known=()
 
     # Из сохранённых конфигов
-    for f in "${MPCTL_DIR}"/vm_*.conf 2>/dev/null; do
+    for f in "${MPCTL_DIR}"/vm_*.conf; do
         [[ -f "$f" ]] || continue
         local id name ip status
         unset VM_ID VM_NAME VM_IP; source "$f" 2>/dev/null || continue
