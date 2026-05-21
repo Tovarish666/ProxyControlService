@@ -358,18 +358,21 @@ do_install_proxyvethmp() {
 
     prompt "SHEET_CSV_URL (Enter = позже)" "" SHEET_CSV_URL; SHEET_CSV_URL=${SHEET_CSV_URL:-}
 
-    step "Скачиваем proxyveth_mp.py..."
-    vm_run "
-wget -q -O /usr/local/bin/proxyveth_mp.py '${PROXYVETHMP_URL}'
-# Проверяем что скачали Python скрипт, а не 404-страницу
-head -1 /usr/local/bin/proxyveth_mp.py | grep -q '^#!' || {
-    echo 'ОШИБКА: proxyveth_mp.py не найден в репозитории (404)'
-    rm -f /usr/local/bin/proxyveth_mp.py
-    exit 1
-}
-chmod +x /usr/local/bin/proxyveth_mp.py
-ln -sf /usr/local/bin/proxyveth_mp.py /usr/local/bin/proxyveth
-" || fail "proxyveth_mp.py не найден в репо: ${PROXYVETHMP_URL}"
+    # Скачиваем на хосте Proxmox (у хоста точно есть интернет),
+    # потом копируем на VM по SCP через локальную сеть.
+    step "Скачиваем proxyveth_mp.py на хост..."
+    local _pyfile; _pyfile=$(mktemp /tmp/proxyveth_mp.XXXXXX.py)
+    wget -q --timeout=30 -O "$_pyfile" "${PROXYVETHMP_URL}" \
+        || { rm -f "$_pyfile"; fail "Не удалось скачать ${PROXYVETHMP_URL}"; }
+    head -1 "$_pyfile" | grep -q '^#!' \
+        || { rm -f "$_pyfile"; fail "Файл не является Python-скриптом (404 или пусто?)"; }
+
+    step "Копируем proxyveth_mp.py на VM..."
+    scp $SSH_OPTS "$_pyfile" root@"${VM_IP}":/usr/local/bin/proxyveth_mp.py \
+        || { rm -f "$_pyfile"; fail "SCP не удался — проверь IP и SSH доступ"; }
+    rm -f "$_pyfile"
+
+    vm_exec "chmod +x /usr/local/bin/proxyveth_mp.py && ln -sf /usr/local/bin/proxyveth_mp.py /usr/local/bin/proxyveth"
     ok "proxyveth_mp.py установлен"
 
     vm_run "mkdir -p /etc/proxyvethmp/logs"
