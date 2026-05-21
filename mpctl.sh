@@ -71,12 +71,21 @@ vm_run()       { ssh $SSH_OPTS root@"${VM_IP}" bash -s <<< "$1"; }
 vm_reachable() { [[ -n "${VM_IP:-}" ]] && vm_exec true 2>/dev/null; }
 vm_running()   { [[ -n "${VM_ID:-}" ]] && qm status "$VM_ID" 2>/dev/null | grep -q "running"; }
 
-# ── Получить IP через ARP по MAC адресу ─────────────────────────
-fetch_vm_ip_arp() {
-    local id="${1:-$VM_ID}"
-    local mac; mac=$(qm config "$id" | grep "^net0:" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
-    [[ -n "$mac" ]] || return 1
-    ip neigh | grep -i "$mac" | grep -v "FAILED\|INCOMPLETE" | awk '{print $1}' | head -1
+# ── Получить IP через qm terminal (Ubuntu пишет IP в MOTD) ───────
+fetch_vm_ip_terminal() {
+    apt-get install -y -qq expect 2>/dev/null
+    expect -f - 2>/dev/null <<EXPECT | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^127\.' | head -1
+log_user 1
+set timeout 90
+spawn qm terminal $VM_ID
+sleep 3
+send "\r"
+expect "login:"    { send "root\r" }
+expect "Password:" { send "${VM_PASSWORD}\r" }
+expect "#"         { send "hostname -I\r" }
+expect "#"         { send "\x1d" }
+expect eof
+EXPECT
 }
 
 # ── Dashboard ────────────────────────────────────────────────────
@@ -118,7 +127,7 @@ need_ip() {
     load_state
     if [[ -z "${VM_IP:-}" ]]; then
         if [[ -n "${VM_ID:-}" ]] && vm_running 2>/dev/null; then
-            VM_IP=$(fetch_vm_ip_arp "$VM_ID")
+            VM_IP=$(fetch_vm_ip_arp "$VM_ID" 2>/dev/null || true)
             [[ -n "$VM_IP" ]] && { save_state; return; }
         fi
         ask "IP VM:"; _rd VM_IP
@@ -226,16 +235,16 @@ do_install_vm() {
     hdr "Запуск VM"
     qm start "$VM_ID"
 
-    # IP через ARP — ждём пока VM получит адрес по DHCP и появится на бридже
-    spinner_start "Ждём IP (ARP)..."
-    local elapsed=0
-    while true; do
-        VM_IP=$(fetch_vm_ip_arp "$VM_ID")
-        [[ -n "$VM_IP" ]] && break
-        sleep 5; elapsed=$((elapsed+5))
-        [[ $elapsed -ge 120 ]] && { spinner_stop; fail "VM не появилась в ARP за 2 мин. Проверь DHCP/бридж."; }
-    done
-    spinner_stop; ok "VM IP: ${VM_IP}"
+    spinner_start "Ждём загрузки VM (45с)..."; sleep 45; spinner_stop
+
+    step "Получаем IP через qm terminal..."
+    VM_IP=$(fetch_vm_ip_terminal)
+    if [[ -z "$VM_IP" ]]; then
+        warn "Не удалось получить IP автоматически"
+        ask "Введи IP VM вручную (см. qm terminal ${VM_ID}):"; _rd VM_IP
+    fi
+    [[ -n "$VM_IP" ]] || fail "IP VM не задан"
+    ok "VM IP: ${VM_IP}"
 
     # SSH работает по ключу из cloud-init --sshkeys, фиксить конфиг не нужно
     spinner_start "Ждём SSH..."
