@@ -28,15 +28,17 @@ warn() { echo -e "  ${Y}⚠${R} $*"; }
 step() { echo -e "  ${D}→${R} $*"; }
 hdr()  { echo -e "\n${B}══════════════════════════════════════════\n  $*\n══════════════════════════════════════════${R}"; }
 
-# ── Ввод с readline (backspace/delete работают, дефолт предзаполнен) ─
+# ── Ввод с readline ──────────────────────────────────────────────
+# Дефолт показан в [скобках], поле пустое — Enter принимает дефолт.
+# Backspace/delete работают только на том что ты набрал сам.
 # prompt "Метка" "дефолт" VARNAME
 prompt() {
     local label="$1" default="${2:-}" varname="$3"
     local hint=""
     [[ -n "$default" ]] && hint=" ${D}[${default}]${R}"
     echo -ne "  ${C}?${R} ${label}${hint}: "
-    IFS= read -r -e -i "$default" "$varname" </dev/tty || true
-    # если стёрли и нажали Enter — восстанавливаем дефолт
+    IFS= read -r -e "$varname" </dev/tty || true
+    # пустой ввод → дефолт
     [[ -z "${!varname}" && -n "$default" ]] && printf -v "$varname" '%s' "$default"
 }
 # Пароль (без эха)
