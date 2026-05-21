@@ -162,6 +162,21 @@ vm_run()       { ssh $SSH_OPTS root@"${VM_IP}" bash -s <<< "$1"; }
 vm_reachable() { [[ -n "${VM_IP:-}" ]] && vm_exec true 2>/dev/null; }
 vm_running()   { [[ -n "${VM_ID:-}" ]] && qm status "$VM_ID" 2>/dev/null | grep -q "running"; }
 
+# Ждём пока apt/dpkg освободятся на VM (unattended-upgrades после буткапа)
+vm_wait_apt() {
+    step "Проверяем apt на VM..."
+    vm_run "
+systemctl stop unattended-upgrades 2>/dev/null || true
+systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+elapsed=0
+while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; do
+    echo '  apt занят, ждём...' >&2
+    sleep 3; elapsed=\$((elapsed+3))
+    [[ \$elapsed -ge 120 ]] && break
+done
+" 2>/dev/null || true
+}
+
 # ── Проверить что VM_IP задан (с попыткой автодетекта) ────────────
 need_ip() {
     load_state
@@ -336,8 +351,10 @@ do_install_vm() {
     spinner_stop; ok "SSH доступен"
 
     hdr "Базовая настройка Ubuntu"
+    vm_wait_apt
     vm_run "
 export DEBIAN_FRONTEND=noninteractive
+systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 apt-get update -qq && apt-get upgrade -y -qq
 apt-get install -y -qq curl wget mc net-tools
 hostnamectl set-hostname ${VM_NAME}
@@ -383,6 +400,7 @@ do_install_proxyvethmp() {
         vm_exec "touch /etc/proxyvethmp/env"
     fi
 
+    vm_wait_apt
     step "Установка зависимостей (tun2socks)..."
     vm_exec "proxyveth install"
     ok "Зависимости установлены"
