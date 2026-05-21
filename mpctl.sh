@@ -57,6 +57,7 @@ prompt_choice() {
     echo -ne "  ${C}»${R} Выбор: "
     CHOICE=""
     read -r CHOICE </dev/tty || true
+    CHOICE="${CHOICE//[[:space:]]/}"  # убираем пробелы/пробел до и после
 }
 
 # ── Spinner ──────────────────────────────────────────────────────
@@ -360,9 +361,15 @@ do_install_proxyvethmp() {
     step "Скачиваем proxyveth_mp.py..."
     vm_run "
 wget -q -O /usr/local/bin/proxyveth_mp.py '${PROXYVETHMP_URL}'
+# Проверяем что скачали Python скрипт, а не 404-страницу
+head -1 /usr/local/bin/proxyveth_mp.py | grep -q '^#!' || {
+    echo 'ОШИБКА: proxyveth_mp.py не найден в репозитории (404)'
+    rm -f /usr/local/bin/proxyveth_mp.py
+    exit 1
+}
 chmod +x /usr/local/bin/proxyveth_mp.py
 ln -sf /usr/local/bin/proxyveth_mp.py /usr/local/bin/proxyveth
-"
+" || fail "proxyveth_mp.py не найден в репо: ${PROXYVETHMP_URL}"
     ok "proxyveth_mp.py установлен"
 
     vm_run "mkdir -p /etc/proxyvethmp/logs"
@@ -557,9 +564,9 @@ do_set_ssh() {
 # ══════════════════════════════════════════════════════════════════
 #  MANAGE
 # ══════════════════════════════════════════════════════════════════
-do_pvmp_status()     { need_ip; vm_exec "proxyveth status"; }
-do_pvmp_status_wan() { need_ip; vm_exec "proxyveth status --wan"; }
-do_pvmp_sync()       { need_ip; vm_exec "proxyveth sync && proxyveth up all"; ok "Sync + Up выполнены"; }
+do_pvmp_status()     { need_ip; vm_exec "proxyveth status"       || warn "proxyveth не отвечает"; }
+do_pvmp_status_wan() { need_ip; vm_exec "proxyveth status --wan"  || warn "proxyveth не отвечает"; }
+do_pvmp_sync()       { need_ip; vm_exec "proxyveth sync && proxyveth up all" || warn "Ошибка sync"; ok "Sync + Up выполнены"; }
 
 do_pvmp_restart() {
     need_ip
