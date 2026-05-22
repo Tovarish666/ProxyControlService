@@ -460,6 +460,7 @@ WantedBy=timers.target
     log_ok("Все сервисы enabled")
 
 def cmd_setup():
+    global SHEET_CSV_URL
     header("ProxyVethMP — УСТАНОВКА")
     if not SHEET_CSV_URL and not SHEET_ID:
         print(f"\n  {Y}SHEET_CSV_URL не задан.{R}")
@@ -468,7 +469,7 @@ def cmd_setup():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         open(ENV_FILE,"w").write(f"SHEET_CSV_URL={url}\n")
         log_ok(f"Сохранено в {ENV_FILE}"); os.environ["SHEET_CSV_URL"]=url
-        global SHEET_CSV_URL; SHEET_CSV_URL=url
+        SHEET_CSV_URL=url
     cmd_install(); config=do_sync(); cmd_init(); cmd_up("all"); setup_systemd()
     link=Path("/usr/local/bin/proxyveth"); link.unlink(missing_ok=True); link.symlink_to(SCRIPT_PATH)
     log_ok("Symlink: proxyveth → proxyveth_mp.py")
