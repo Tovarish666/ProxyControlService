@@ -60,8 +60,9 @@ def run_safe(cmd, **kw): return run(cmd, check=False, **kw)
 def is_ns_exists(n):
     r=run_safe("ip netns list", capture=True)
     for line in r.stdout.strip().split("\n"):
-        if line.split()[0] if line.strip() else ""==f"ns_{n}": return True
-    return f"ns_{n}" in r.stdout
+        name = line.split()[0] if line.strip() else ""
+        if name == f"ns_{n}": return True
+    return False
 
 def is_process_running(pattern):
     return run_safe(f"pgrep -f '{pattern}'", capture=True).returncode==0
