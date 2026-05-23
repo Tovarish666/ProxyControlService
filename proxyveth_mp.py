@@ -71,49 +71,75 @@ def _ensure_yaspeed():
     run(f"chmod +x {YASPEED_BIN}", capture=True); return True
 
 def _speed_test_ns(n):
-    """Download speed + ping через namespace ns_n. Возвращает (dl_str, ping_str)."""
+    """Download speed + ping + WAN IP через namespace ns_n.
+    Возвращает (dl_str, ping_str, wan_ip_str)."""
     import re
-    dl = ping = "—"
+    dl = ping = wan_ip = "—"
 
-    # ── yaspeed (если есть) ──────────────────────────────────────
+    # ── yaspeed (если установлен) ────────────────────────────────
     if Path(YASPEED_BIN).exists():
-        r = run_safe(f"ip netns exec ns_{n} timeout 40 {YASPEED_BIN}",
+        r = run_safe(f"ip netns exec ns_{n} timeout 45 {YASPEED_BIN}",
                      capture=True, quiet=True)
-        out = r.stdout.strip() if r.returncode == 0 else ""
+        out = r.stdout.strip()
         if out:
+            # JSON mode
             try:
                 import json as _j; d = _j.loads(out)
                 sp = d.get("download", d.get("dl", d.get("downloadBandwidth", 0)))
-                if sp > 1e4: sp /= 1e6           # bps → Mbit/s
+                if sp > 1e4: sp /= 1e6
                 pg = d.get("ping", {}); pg = pg.get("latency", 0) if isinstance(pg, dict) else pg
-                return f"{sp:.1f} Mb/s", f"{int(pg)} ms"
+                ip4 = d.get("ip", d.get("external_ip", d.get("wan_ip", d.get("externalIp", ""))))
+                return f"{sp:.1f} Mb/s", f"{int(pg)} ms", ip4 or "—"
             except: pass
+            # Text mode
             for line in out.splitlines():
                 lc = line.lower()
-                if dl   == "—" and any(k in lc for k in ("download","скачив","↓","загрузк")):
+                if dl == "—" and any(k in lc for k in ("download","скачив","↓","загрузк")):
                     m = re.search(r"([\d.]+)", line)
-                    if m: dl   = f"{float(m.group(1)):.1f} Mb/s"
+                    if m: dl = f"{float(m.group(1)):.1f} Mb/s"
                 if ping == "—" and any(k in lc for k in ("ping","задерж","latency")):
                     m = re.search(r"([\d.]+)", line)
                     if m: ping = f"{int(float(m.group(1)))} ms"
-            if dl != "—" or ping != "—": return dl, ping
+                if wan_ip == "—":
+                    m = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", line)
+                    if m: wan_ip = m.group(1)
+            if dl != "—" or ping != "—": return dl, ping, wan_ip
 
     # ── Fallback: ping 8.8.8.8 + curl Cloudflare ─────────────────
     r_p = run_safe(f"ip netns exec ns_{n} ping -c 3 -q 8.8.8.8", capture=True, quiet=True)
     if r_p.returncode == 0:
         m = re.search(r"avg[^=]*=\s*[\d.]+/([\d.]+)/", r_p.stdout)
         if m: ping = f"{int(float(m.group(1)))} ms"
+
     r_d = run_safe(
-        f"ip netns exec ns_{n} curl -s --max-time 15 "
+        f"ip netns exec ns_{n} curl -s --max-time 10 "
         f"-o /dev/null -w '%{{speed_download}}' "
-        f"'https://speed.cloudflare.com/__down?bytes=5000000'",
+        f"'https://speed.cloudflare.com/__down?bytes=2000000'",
         capture=True, quiet=True)
-    if r_d.returncode == 0:
+    # Принимаем exit 0 И exit 28 (timeout) — curl всё равно записывает скорость в stdout
+    if r_d.stdout.strip():
         try:
             sp = float(r_d.stdout.strip())
             if sp > 0: dl = f"{sp/1e6:.1f} Mb/s"
         except: pass
-    return dl, ping
+    return dl, ping, wan_ip
+
+def _check_one_ns(n):
+    """Все проверки для ns_n. Возвращает dict с результатами."""
+    res = {"wan_ip": "—", "dl": "—", "ping": "—", "ip_ok": False, "ysp_ok": False}
+    # 2ip.ru через veth-интерфейс хоста → WAN IP
+    r2 = run_safe(f"curl -s --max-time 8 --interface 192.168.{n}.100 2ip.ru",
+                  capture=True, quiet=True)
+    if r2.returncode == 0 and r2.stdout.strip():
+        res["ip_ok"] = True
+        res["wan_ip"] = r2.stdout.strip()
+    # Speed + ping + WAN IP из yaspeed/fallback (через namespace → tun2socks → SOCKS5)
+    dl, ping, ysp_ip = _speed_test_ns(n)
+    res["dl"] = dl; res["ping"] = ping; res["ysp_ok"] = dl != "—"
+    # Если 2ip не дал IP — берём из yaspeed
+    if res["wan_ip"] == "—" and ysp_ip != "—":
+        res["wan_ip"] = ysp_ip
+    return res
 
 def is_ns_exists(n):
     r=run_safe("ip netns list", capture=True)
@@ -407,37 +433,46 @@ def cmd_status():
     if config.get("last_sync"): log_info(f"Sync: {config['last_sync']}")
 
 def cmd_check():
-    """Комплексная диагностика: скорость + ping + 2ip ✓/✗ для всех активных NS."""
+    """Параллельная диагностика: WAN IP + скорость + ping + статус для всех NS."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     header("CHECK")
     config=load_config(); modems=config.get("modems",{}); active_ns=set(get_active_ns_list())
     _ensure_yaspeed()
-    src = "yaspeed" if Path(YASPEED_BIN).exists() else "curl+ping"
-    print(f"\n  {D}Источник скорости: {src}{R}")
-    print(f"\n  {'N':>3} │ {'Proxy':<22} │ {'DL':^10} │ {'Ping':^6} │ 2ip │ Статус")
-    print(f"  {'─'*3}─┼─{'─'*22}─┼─{'─'*10}─┼─{'─'*6}─┼─{'─'*3}─┼─{'─'*8}")
+    src = "yaspeed" if Path(YASPEED_BIN).exists() else "curl+ping (fallback)"
+    print(f"  {D}Источник скорости: {src}{R}")
+
+    # Разбиваем на to_check (активные) и статичные строки
+    ns_list = sorted((int(n), m) for n, m in modems.items() if m.get("enabled", True) and int(n) in active_ns)
+    log_info(f"Проверяем {len(ns_list)} NS параллельно...")
+
+    # Параллельный запуск всех проверок
+    results = {}
+    if ns_list:
+        with ThreadPoolExecutor(max_workers=min(len(ns_list), 15)) as ex:
+            futs = {ex.submit(_check_one_ns, n): n for n, _ in ns_list}
+            for fut in as_completed(futs):
+                n = futs[fut]
+                try:    results[n] = fut.result()
+                except: results[n] = {"wan_ip":"—","dl":"—","ping":"—","ip_ok":False,"ysp_ok":False}
+
+    print(f"\n  {'N':>3} │ {'WAN IP':<15} │ {'DL':^10} │ {'Ping':^6} │ Статус")
+    print(f"  {'─'*3}─┼─{'─'*15}─┼─{'─'*10}─┼─{'─'*6}─┼─{'─'*8}")
     ok=wl=dead=0
     for n_str in sorted(modems, key=lambda x: int(x)):
         n=int(n_str); m=modems[n_str]; en=m.get("enabled",True)
-        ps=f"{m['proxy_host']}:{m['proxy_port']}"
         if not en:
-            print(f"  {n:>3} │ {D}{ps:<22}{R} │ {'—':^10} │ {'—':^6} │  —  │ {D}off{R}"); continue
+            print(f"  {n:>3} │ {D}{'—':<15}{R} │ {'—':^10} │ {'—':^6} │ {D}off{R}"); continue
         if n not in active_ns:
-            dead+=1
-            print(f"  {n:>3} │ {ps:<22} │ {'—':^10} │ {'—':^6} │  —  │ {RD}DEAD{R}"); continue
-        # 2ip ✓/✗ — через хост-интерфейс veth
-        r2=run_safe(f"curl -s --max-time 8 --interface 192.168.{n}.100 2ip.ru",capture=True,quiet=True)
-        ip_ok=r2.returncode==0 and bool(r2.stdout.strip())
-        # Speed test через namespace (tun2socks → SOCKS5 → мобильный инет)
-        dl,ping=_speed_test_ns(n)
-        ysp_ok=dl!="—"
-        # Диагноз
-        if not ip_ok and not ysp_ok: diag=f"{RD}{'DEAD':<8}{R}"; dead+=1
-        elif not ip_ok:              diag=f"{Y}{'WLIST':<8}{R}"; wl+=1
-        else:                        diag=f"{G}{'OK':<8}{R}";    ok+=1
-        ic=G if ip_ok else RD; im="✓" if ip_ok else "✗"
-        print(f"  {n:>3} │ {ps:<22} │ {dl:^10} │ {ping:^6} │ {ic}{im:^3}{R} │ {diag}")
+            dead+=1; print(f"  {n:>3} │ {'—':<15} │ {'—':^10} │ {'—':^6} │ {RD}DEAD{R}"); continue
+        r=results.get(n, {}); wan_ip=r.get("wan_ip","—"); dl=r.get("dl","—"); ping=r.get("ping","—")
+        ip_ok=r.get("ip_ok",False); ysp_ok=r.get("ysp_ok",False)
+        if not ip_ok and not ysp_ok: diag=f"{RD}DEAD{R}";  dead+=1
+        elif not ip_ok:              diag=f"{Y}WLIST{R}";  wl+=1
+        else:                        diag=f"{G}OK{R}";     ok+=1
+        ip_c=G if ip_ok else RD
+        print(f"  {n:>3} │ {ip_c}{wan_ip:<15}{R} │ {dl:^10} │ {ping:^6} │ {diag}")
     print()
-    log_info(f"OK:{ok}  WLIST:{wl}  DEAD:{dead}  Active NS:{len(active_ns)}")
+    log_info(f"OK:{ok}  WLIST:{wl}  DEAD:{dead}  Active:{len(active_ns)}")
     if config.get("last_sync"): log_info(f"Sync: {config['last_sync']}")
 
 def cmd_up(target):
