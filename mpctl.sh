@@ -81,10 +81,10 @@ spinner_stop() {
 #  /etc/mpctl/vm_106.conf  — конфиг конкретной VM
 #  /etc/mpctl/active       — ID активной VM
 # ══════════════════════════════════════════════════════════════════
-VM_ID="" VM_NAME="proxyvethmp" VM_IP="" VM_BRIDGE="vmbr0"
+VM_ID="" VM_NAME="proxyvethmp" VM_IP="" VM_BRIDGE="vmbr0" VM_PASSWORD=""
 
 load_state() {
-    VM_ID="" VM_NAME="proxyvethmp" VM_IP="" VM_BRIDGE="vmbr0"
+    VM_ID="" VM_NAME="proxyvethmp" VM_IP="" VM_BRIDGE="vmbr0" VM_PASSWORD=""
     mkdir -p "$MPCTL_DIR"
     local active_id=""
     [[ -f "${MPCTL_DIR}/active" ]] && active_id=$(cat "${MPCTL_DIR}/active")
@@ -99,6 +99,7 @@ VM_ID=${VM_ID}
 VM_NAME=${VM_NAME:-proxyvethmp}
 VM_IP=${VM_IP:-}
 VM_BRIDGE=${VM_BRIDGE:-vmbr0}
+VM_PASSWORD=${VM_PASSWORD:-}
 EOF
     echo "$VM_ID" > "${MPCTL_DIR}/active"
 }
@@ -222,9 +223,14 @@ show_dashboard() {
         if vm_running 2>/dev/null; then
             vm_status="running"; vm_dot="${G}●${R}"
             if [[ -n "${VM_IP:-}" ]] && vm_reachable 2>/dev/null; then
-                st_mp=$(vm_exec   "systemctl is-active mproxy      2>/dev/null" 2>/dev/null || echo "—")
-                st_pvmp=$(vm_exec "systemctl is-active proxyvethmp 2>/dev/null" 2>/dev/null || echo "—")
-                wan=$(vm_exec "curl -s --max-time 4 2ip.ru" 2>/dev/null || echo "—")
+                local _info
+                _info=$(vm_exec "printf '%s\n%s\n%s\n' \
+                    \"\$(systemctl is-active mproxy 2>/dev/null || echo inactive)\" \
+                    \"\$(systemctl is-active proxyvethmp 2>/dev/null || echo inactive)\" \
+                    \"\$(curl -s --max-time 4 2ip.ru 2>/dev/null || echo '—')\"" 2>/dev/null || echo -e "—\n—\n—")
+                st_mp=$(echo "$_info"   | sed -n '1p')
+                st_pvmp=$(echo "$_info" | sed -n '2p')
+                wan=$(echo "$_info"     | sed -n '3p')
             fi
         else
             vm_status="stopped"; vm_dot="${RD}●${R}"
@@ -284,7 +290,15 @@ do_install_vm() {
         ok "Старая VM удалена"
     fi
 
-    prompt "Имя VM"   "proxyvethmp" VM_NAME
+    # Proxmox принимает только DNS-совместимые имена: буквы/цифры/дефис,
+    # начинается с буквы или цифры, не заканчивается на дефис.
+    while true; do
+        prompt "Имя VM (буквы/цифры/дефис, напр. proxyvethmp)" "proxyvethmp" VM_NAME
+        if [[ "$VM_NAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$ ]]; then
+            break
+        fi
+        warn "Недопустимое имя «${VM_NAME}» — только латинские буквы, цифры и дефис (не начинается и не заканчивается на дефис)"
+    done
     prompt "RAM, MB"  "8192"        VM_RAM
     prompt "CPU ядра" "8"           VM_CORES
     prompt "Диск, GB" "50"          VM_DISK
@@ -311,7 +325,8 @@ do_install_vm() {
         --name    "$VM_NAME"  --memory "$VM_RAM"   --cores "$VM_CORES" \
         --cpu     host        --net0   "virtio,bridge=${VM_BRIDGE}" \
         --ostype  l26         --machine q35         --scsihw virtio-scsi-pci \
-        --serial0 socket      --onboot 1
+        --serial0 socket      --onboot 1 \
+        || { warn "qm create завершился с ошибкой (см. выше). Установка прервана."; return 1; }
     ok "VM создана (ID=${VM_ID})"
 
     step "Импорт диска..."
@@ -539,12 +554,14 @@ do_set_sheet() {
     need_ip
     prompt "SHEET_CSV_URL" "" URL
     [[ -n "${URL:-}" ]] || fail "Пусто"
+    # Экранируем & для sed replacement (&  = "matched text" в sed)
+    local ESCAPED_URL; ESCAPED_URL=$(printf '%s' "$URL" | sed 's/[&\]/\\&/g')
     vm_exec "grep -q '^SHEET_CSV_URL=' /etc/proxyvethmp/env \
-        && sed -i 's|^SHEET_CSV_URL=.*|SHEET_CSV_URL=${URL}|' /etc/proxyvethmp/env \
+        && sed -i 's|^SHEET_CSV_URL=.*|SHEET_CSV_URL=${ESCAPED_URL}|' /etc/proxyvethmp/env \
         || echo 'SHEET_CSV_URL=${URL}' >> /etc/proxyvethmp/env"
     ok "URL сохранён"
     prompt "Запустить sync + up all? (yes/no)" "yes" _c
-    [[ "${_c:-}" == "yes" ]] && vm_exec "proxyveth sync && proxyveth up all" && ok "Sync + Up выполнены"
+    [[ "${_c:-}" == "yes" ]] && { vm_exec "proxyveth sync && proxyveth up all" && ok "Sync + Up выполнены" || warn "Ошибка sync"; }
 }
 
 do_change_vm_params() {
@@ -566,6 +583,8 @@ do_change_password() {
     vm_exec "echo 'root:${NEW_PASS}' | chpasswd"
     load_state
     [[ -n "${VM_ID:-}" ]] && qm set "$VM_ID" --cipassword "$NEW_PASS" 2>/dev/null || true
+    VM_PASSWORD="$NEW_PASS"
+    save_state
     ok "Пароль изменён"
 }
 
@@ -585,19 +604,18 @@ do_set_ssh() {
 # ══════════════════════════════════════════════════════════════════
 #  MANAGE
 # ══════════════════════════════════════════════════════════════════
-do_pvmp_status()  { need_ip; vm_exec "proxyveth status" || warn "proxyveth не отвечает"; }
-do_pvmp_check()   { need_ip; vm_exec "proxyveth check"  || warn "proxyveth не отвечает"; }
-do_pvmp_sync()    { need_ip; vm_exec "proxyveth sync && proxyveth up all" || warn "Ошибка sync"; ok "Sync + Up выполнены"; }
+do_pvmp_status()  { need_ip; vm_exec "proxyveth status"  || warn "proxyveth не отвечает"; }
+do_pvmp_check()   { need_ip; vm_exec "proxyveth check"   || warn "proxyveth не отвечает"; }
+do_pvmp_sync()    { need_ip; vm_exec "proxyveth sync && proxyveth up all" && ok "Sync + Up выполнены" || warn "Ошибка sync"; }
 
 do_pvmp_restart() {
     need_ip
     prompt "Номер NS или all" "all" TARGET
-    vm_exec "proxyveth restart ${TARGET}"; ok "Перезапущено: $TARGET"
+    vm_exec "proxyveth restart ${TARGET}" && ok "Перезапущено: $TARGET" || warn "Ошибка restart"
 }
-
 do_pvmp_logs() {
     need_ip; echo -e "\n  ${D}Ctrl+C для выхода${R}"
-    vm_exec "tail -f /etc/proxyvethmp/logs/watchdog.log"
+    vm_exec "tail -f /etc/proxyvethmp/logs/watchdog.log" || true
 }
 
 do_reboot_vm() {
@@ -610,11 +628,13 @@ do_reboot_vm() {
 do_show_summary() {
     need_ip; load_state
     local wan; wan=$(vm_exec "curl -s --max-time 5 2ip.ru" 2>/dev/null || echo "—")
+    local pass_display="${VM_PASSWORD:-${RD}(не сохранён — смени через [2]→[4])${R}}"
     echo -e "\n  ${G}Сводка для ЛК mobileproxy.space:${R}"
     echo -e "  ${B}════════════════════════════════════════${R}"
     echo -e "  Статический IP : ${wan}"
     echo -e "  LocalIP        : ${VM_IP}"
     echo -e "  Root login     : root"
+    echo -e "  Root password  : ${pass_display}"
     echo -e "  OS             : Unix"
     echo -e "  ${B}════════════════════════════════════════${R}"
     echo -e "  Мой прокси-бизнес → Сервера → ✏ Редактировать\n"
