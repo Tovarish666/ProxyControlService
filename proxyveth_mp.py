@@ -105,34 +105,45 @@ def _speed_test_ns(n):
                     if m: wan_ip = m.group(1)
             if dl != "—" or ping != "—": return dl, ping, wan_ip
 
-    # ── Fallback: ping 8.8.8.8 + curl Cloudflare ─────────────────
+    # ── Fallback: ping 8.8.8.8 + speed test (HTTP, работает через tun2socks) ──
     r_p = run_safe(f"ip netns exec ns_{n} ping -c 3 -q 8.8.8.8", capture=True, quiet=True)
     if r_p.returncode == 0:
         m = re.search(r"avg[^=]*=\s*[\d.]+/([\d.]+)/", r_p.stdout)
         if m: ping = f"{int(float(m.group(1)))} ms"
 
-    r_d = run_safe(
-        f"ip netns exec ns_{n} curl -s --max-time 10 "
-        f"-o /dev/null -w '%{{speed_download}}' "
-        f"'https://speed.cloudflare.com/__down?bytes=2000000'",
-        capture=True, quiet=True)
-    # Принимаем exit 0 И exit 28 (timeout) — curl всё равно записывает скорость в stdout
-    if r_d.stdout.strip():
-        try:
-            sp = float(r_d.stdout.strip())
-            if sp > 0: dl = f"{sp/1e6:.1f} Mb/s"
-        except: pass
+    # HTTP (не HTTPS) — надёжнее работает через tun2socks + SOCKS5
+    _speed_urls = [
+        "http://speedtest.tele2.net/1MB.zip",
+        "http://proof.ovh.net/files/1Mb.dat",
+        "http://ipv4.download.thinkbroadband.com/1MB.zip",
+    ]
+    for _url in _speed_urls:
+        r_d = run_safe(
+            f"ip netns exec ns_{n} curl -s -L --max-time 15 "
+            f"-o /dev/null -w '%{{speed_download}}' '{_url}'",
+            capture=True, quiet=True)
+        if r_d.stdout.strip():
+            try:
+                sp = float(r_d.stdout.strip())
+                if sp > 0:
+                    dl = f"{sp/1e6:.1f} Mb/s"
+                    break
+            except: pass
     return dl, ping, wan_ip
 
 def _check_one_ns(n):
     """Все проверки для ns_n. Возвращает dict с результатами."""
+    import re as _re
+    _ipv4 = _re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
     res = {"wan_ip": "—", "dl": "—", "ping": "—", "ip_ok": False, "ysp_ok": False}
-    # 2ip.ru через veth-интерфейс хоста → WAN IP
+    # 2ip.ru через veth-интерфейс хоста → WAN IP (только если ответ — реальный IPv4)
     r2 = run_safe(f"curl -s --max-time 8 --interface 192.168.{n}.100 2ip.ru",
                   capture=True, quiet=True)
-    if r2.returncode == 0 and r2.stdout.strip():
-        res["ip_ok"] = True
-        res["wan_ip"] = r2.stdout.strip()
+    if r2.returncode == 0:
+        ip_str = r2.stdout.strip()
+        if _ipv4.match(ip_str):
+            res["ip_ok"] = True
+            res["wan_ip"] = ip_str
     # Speed + ping + WAN IP из yaspeed/fallback (через namespace → tun2socks → SOCKS5)
     dl, ping, ysp_ip = _speed_test_ns(n)
     res["dl"] = dl; res["ping"] = ping; res["ysp_ok"] = dl != "—"
