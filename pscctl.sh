@@ -1,14 +1,14 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 #  pscctl — Proxy Control Service  v1.2
-#  https://github.com/Tovarish666/ProxyVethMP
+#  https://github.com/Tovarish666/ProxyControlService
 #
-#  Запуск: bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main/pscctl.sh)
+#  Запуск: bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main/pscctl.sh)
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
 VERSION="1.2"
-GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main"
+GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main"
 PROXYVETH_URL="${GITHUB_RAW}/proxyveth.py"
 SELF_URL="${GITHUB_RAW}/pscctl.sh"
 

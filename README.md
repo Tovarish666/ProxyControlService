@@ -34,7 +34,7 @@ mproxy отправляет трафик через `192.168.N.100` → veth →
 
 ```bash
 # На хосте Proxmox, от root:
-bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main/pscctl.sh)
+bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main/pscctl.sh)
 ```
 
 Меню само предложит что установить — VM, ProxyVeth, mp.space, или всё сразу.

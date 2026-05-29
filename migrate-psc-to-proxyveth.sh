@@ -130,7 +130,7 @@ migrate_host() {
     else
         warn "/etc/psc не найден — нечего мигрировать"
     fi
-    ok "Готово. Обнови pscctl: bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main/pscctl.sh)"
+    ok "Готово. Обнови pscctl: bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main/pscctl.sh)"
 }
 
 case "$ROLE" in
