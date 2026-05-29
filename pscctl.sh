@@ -489,16 +489,23 @@ do_install_mp() {
     [[ -n "${AUTH_MP_CONTENT:-}" ]] || fail "auth.mp не может быть пустым"
 
     step "install.sh..."
-    vm_exec "wget -O - https://mobileproxy.space/downloads/sp/install.sh | bash"
+    # install.sh может завершиться обрывом сессии — не валим set -e
+    vm_exec "wget -O - https://mobileproxy.space/downloads/sp/install.sh | bash" || true
     ok "install.sh завершён"
 
-    step "setup-modem-management.sh..."
-    vm_exec "wget -O - https://mobileproxy.space/downloads/sp/setup-modem-management.sh | bash"
-    ok "setup-modem-management.sh завершён"
-
+    # ── Пишем СВОЙ токен сразу после install.sh, пока SSH-сессия жива. ──
+    # install.sh генерит собственный auth.mp (proxy_xxx) — его нужно перебить.
+    # Раньше запись стояла ПОСЛЕ setup-modem-management.sh, который ребутает
+    # VM и рвёт сессию → set -e убивал скрипт до записи токена (см. историю бага).
     step "Записываем auth.mp..."
     printf '%s' "$AUTH_MP_CONTENT" | vm_exec "cat > /home/nodejs/work/auth.mp"
-    ok "auth.mp записан"
+    vm_exec "systemctl restart mproxy nodejs-server 2>/dev/null || true"
+    ok "auth.mp записан + сервисы перезапущены"
+
+    step "setup-modem-management.sh..."
+    # ставит GRUB/initramfs и ребутает VM → обрыв пайпа ('Cannot write to -') это норма
+    vm_exec "wget -O - https://mobileproxy.space/downloads/sp/setup-modem-management.sh | bash" || true
+    ok "setup-modem-management.sh завершён"
 
     step "Перезагрузка VM..."
     vm_exec "reboot" || true; sleep 20
@@ -509,6 +516,10 @@ do_install_mp() {
         [[ $elapsed -ge 120 ]] && { spinner_stop; fail "VM не поднялась после ребута"; }
     done
     spinner_stop; ok "VM перезагружена"
+
+    # Контроль: токен должен быть НАШ, а не сгенерённый install.sh (proxy_xxx)
+    step "Проверка auth.mp..."
+    vm_exec "cat /home/nodejs/work/auth.mp" || true
 
     vm_exec "systemctl is-active mproxy nodejs-server 2>/dev/null || true" | while read -r s; do
         [[ "$s" == "active" ]] && ok "Сервис: $s" || warn "Сервис: $s"
