@@ -9,14 +9,14 @@ set -euo pipefail
 
 VERSION="1.2"
 GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyVethMP/main"
-PSC_URL="${GITHUB_RAW}/psc.py"
+PROXYVETH_URL="${GITHUB_RAW}/proxyveth.py"
 SELF_URL="${GITHUB_RAW}/pscctl.sh"
 
 UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 UBUNTU_SHA256_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
 UBUNTU_IMG_PATH="/var/lib/vz/template/iso/ubuntu-24.04-noble.img"
 
-PSC_DIR="/etc/psc"
+PROXYVETH_DIR="/etc/proxyveth"
 
 # ── Цвета ───────────────────────────────────────────────────────
 R="\033[0m"; G="\033[32m"; RD="\033[31m"; Y="\033[33m"
@@ -74,35 +74,35 @@ spinner_stop() {
 
 # ══════════════════════════════════════════════════════════════════
 #  MULTI-VM STATE
-#  /etc/psc/vm_106.conf  — конфиг конкретной VM
-#  /etc/psc/active       — ID активной VM
+#  /etc/proxyveth/vm_106.conf  — конфиг конкретной VM
+#  /etc/proxyveth/active       — ID активной VM
 # ══════════════════════════════════════════════════════════════════
-VM_ID="" VM_NAME="psc" VM_IP="" VM_BRIDGE="vmbr0" VM_PASSWORD=""
+VM_ID="" VM_NAME="proxyveth" VM_IP="" VM_BRIDGE="vmbr0" VM_PASSWORD=""
 
 load_state() {
-    VM_ID="" VM_NAME="psc" VM_IP="" VM_BRIDGE="vmbr0" VM_PASSWORD=""
-    mkdir -p "$PSC_DIR"
+    VM_ID="" VM_NAME="proxyveth" VM_IP="" VM_BRIDGE="vmbr0" VM_PASSWORD=""
+    mkdir -p "$PROXYVETH_DIR"
     local active_id=""
-    [[ -f "${PSC_DIR}/active" ]] && active_id=$(cat "${PSC_DIR}/active")
-    [[ -n "$active_id" && -f "${PSC_DIR}/vm_${active_id}.conf" ]] && source "${PSC_DIR}/vm_${active_id}.conf" || true
+    [[ -f "${PROXYVETH_DIR}/active" ]] && active_id=$(cat "${PROXYVETH_DIR}/active")
+    [[ -n "$active_id" && -f "${PROXYVETH_DIR}/vm_${active_id}.conf" ]] && source "${PROXYVETH_DIR}/vm_${active_id}.conf" || true
 }
 
 save_state() {
-    mkdir -p "$PSC_DIR"
+    mkdir -p "$PROXYVETH_DIR"
     [[ -z "${VM_ID:-}" ]] && return
-    cat > "${PSC_DIR}/vm_${VM_ID}.conf" <<EOF
+    cat > "${PROXYVETH_DIR}/vm_${VM_ID}.conf" <<EOF
 VM_ID=${VM_ID}
-VM_NAME=${VM_NAME:-psc}
+VM_NAME=${VM_NAME:-proxyveth}
 VM_IP=${VM_IP:-}
 VM_BRIDGE=${VM_BRIDGE:-vmbr0}
 VM_PASSWORD=${VM_PASSWORD:-}
 EOF
-    echo "$VM_ID" > "${PSC_DIR}/active"
+    echo "$VM_ID" > "${PROXYVETH_DIR}/active"
 }
 
 list_vms() {
     local -A known=()
-    for f in "${PSC_DIR}"/vm_*.conf; do
+    for f in "${PROXYVETH_DIR}"/vm_*.conf; do
         [[ -f "$f" ]] || continue
         local id name ip status
         unset VM_ID VM_NAME VM_IP; source "$f" 2>/dev/null || continue
@@ -132,15 +132,15 @@ select_vm() {
     local cur="${VM_ID:-}"
     prompt "VM ID" "$cur" VM_ID
     [[ -z "${VM_ID:-}" ]] && { warn "VM не выбрана"; return 1; }
-    if [[ -f "${PSC_DIR}/vm_${VM_ID}.conf" ]]; then
-        source "${PSC_DIR}/vm_${VM_ID}.conf"
+    if [[ -f "${PROXYVETH_DIR}/vm_${VM_ID}.conf" ]]; then
+        source "${PROXYVETH_DIR}/vm_${VM_ID}.conf"
         ok "Активная VM: ${VM_ID} (${VM_NAME}) @ ${VM_IP:-?}"
     else
-        VM_NAME="psc"; VM_IP=""; VM_BRIDGE="vmbr0"
-        VM_NAME=$(qm config "$VM_ID" 2>/dev/null | awk '/^name:/{print $2}' || echo "psc")
-        warn "Новая VM для PSC — конфиг будет создан после установки"
+        VM_NAME="proxyveth"; VM_IP=""; VM_BRIDGE="vmbr0"
+        VM_NAME=$(qm config "$VM_ID" 2>/dev/null | awk '/^name:/{print $2}' || echo "proxyveth")
+        warn "Новая VM для ProxyVeth — конфиг будет создан после установки"
     fi
-    echo "$VM_ID" > "${PSC_DIR}/active"
+    echo "$VM_ID" > "${PROXYVETH_DIR}/active"
 }
 
 # ── SSH ──────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ svc_dot() {
 
 show_dashboard() {
     load_state
-    local vm_status="нет VM" st_mp="—" st_psc="—" wan="—"
+    local vm_status="нет VM" st_mp="—" st_proxyveth="—" wan="—"
     local vm_dot="${D}●${R}"
 
     if [[ -n "${VM_ID:-}" ]]; then
@@ -210,10 +210,10 @@ show_dashboard() {
                 local _info
                 _info=$(vm_exec "printf '%s\n%s\n%s\n' \
                     \"\$(systemctl is-active mproxy 2>/dev/null || echo inactive)\" \
-                    \"\$(systemctl is-active psc 2>/dev/null || echo inactive)\" \
+                    \"\$(systemctl is-active proxyveth 2>/dev/null || echo inactive)\" \
                     \"\$(curl -s --max-time 4 2ip.ru 2>/dev/null || echo '—')\"" 2>/dev/null || echo -e "—\n—\n—")
                 st_mp=$(echo "$_info"  | sed -n '1p')
-                st_psc=$(echo "$_info" | sed -n '2p')
+                st_proxyveth=$(echo "$_info" | sed -n '2p')
                 wan=$(echo "$_info"    | sed -n '3p')
             fi
         else
@@ -232,7 +232,7 @@ show_dashboard() {
         echo -e "  ${D}VM не выбрана — [v] Выбрать VM${R}"
     fi
     printf    "  mp.space:  "; echo -e "$(eval "echo -e \"$(svc_dot "$st_mp")\"") ${st_mp}"
-    printf    "  PSC:       "; echo -e "$(eval "echo -e \"$(svc_dot "$st_psc")\"") ${st_psc}"
+    printf    "  ProxyVeth:       "; echo -e "$(eval "echo -e \"$(svc_dot "$st_proxyveth")\"") ${st_proxyveth}"
     echo ""
 }
 
@@ -275,7 +275,7 @@ do_install_vm() {
     fi
 
     while true; do
-        prompt "Имя VM (буквы/цифры/дефис, напр. psc)" "psc" VM_NAME
+        prompt "Имя VM (буквы/цифры/дефис, напр. proxyveth)" "proxyveth" VM_NAME
         if [[ "$VM_NAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$ ]]; then
             break
         fi
@@ -363,79 +363,79 @@ grep -q '${VM_NAME}' /etc/hosts || echo '127.0.1.1 ${VM_NAME}' >> /etc/hosts
 }
 
 # ══════════════════════════════════════════════════════════════════
-#  INSTALL: PSC
+#  INSTALL: ProxyVeth
 # ══════════════════════════════════════════════════════════════════
-do_install_psc() {
-    hdr "Установка PSC"
+do_install_proxyveth() {
+    hdr "Установка ProxyVeth"
     need_ip
 
     prompt "SHEET_CSV_URL (Enter = позже)" "" SHEET_CSV_URL; SHEET_CSV_URL=${SHEET_CSV_URL:-}
 
-    step "Скачиваем psc.py на хост..."
-    local _pyfile; _pyfile=$(mktemp /tmp/psc.XXXXXX.py)
-    wget -q --timeout=30 -O "$_pyfile" "${PSC_URL}" \
-        || { rm -f "$_pyfile"; fail "Не удалось скачать ${PSC_URL}"; }
+    step "Скачиваем proxyveth.py на хост..."
+    local _pyfile; _pyfile=$(mktemp /tmp/proxyveth.XXXXXX.py)
+    wget -q --timeout=30 -O "$_pyfile" "${PROXYVETH_URL}" \
+        || { rm -f "$_pyfile"; fail "Не удалось скачать ${PROXYVETH_URL}"; }
     head -1 "$_pyfile" | grep -q '^#!' \
         || { rm -f "$_pyfile"; fail "Файл не является Python-скриптом (404 или пусто?)"; }
 
-    step "Копируем psc.py на VM..."
-    scp $SSH_OPTS "$_pyfile" root@"${VM_IP}":/usr/local/bin/psc.py \
+    step "Копируем proxyveth.py на VM..."
+    scp $SSH_OPTS "$_pyfile" root@"${VM_IP}":/usr/local/bin/proxyveth.py \
         || { rm -f "$_pyfile"; fail "SCP не удался — проверь IP и SSH доступ"; }
     rm -f "$_pyfile"
 
-    vm_exec "chmod +x /usr/local/bin/psc.py && ln -sf /usr/local/bin/psc.py /usr/local/bin/psc"
-    ok "psc.py установлен"
+    vm_exec "chmod +x /usr/local/bin/proxyveth.py && ln -sf /usr/local/bin/proxyveth.py /usr/local/bin/proxyveth"
+    ok "proxyveth.py установлен"
 
-    vm_run "mkdir -p /etc/psc/logs"
+    vm_run "mkdir -p /etc/proxyveth/logs"
     if [[ -n "${SHEET_CSV_URL:-}" ]]; then
-        vm_exec "echo 'SHEET_CSV_URL=${SHEET_CSV_URL}' > /etc/psc/env"
+        vm_exec "echo 'SHEET_CSV_URL=${SHEET_CSV_URL}' > /etc/proxyveth/env"
         ok "SHEET_CSV_URL сохранён"
     else
-        vm_exec "touch /etc/psc/env"
+        vm_exec "touch /etc/proxyveth/env"
     fi
 
     vm_wait_apt
     step "Установка зависимостей (tun2socks)..."
-    vm_exec "psc install"
+    vm_exec "proxyveth install"
     ok "Зависимости установлены"
 
     if [[ -n "${SHEET_CSV_URL:-}" ]]; then
         step "Sync + Up all..."
-        vm_exec "SHEET_CSV_URL='${SHEET_CSV_URL}' psc sync && psc up all"
+        vm_exec "SHEET_CSV_URL='${SHEET_CSV_URL}' proxyveth sync && proxyveth up all"
         ok "NS подняты"
     fi
 
     step "Настройка systemd..."
     vm_exec bash << 'REMOTE'
-cat > /etc/systemd/system/psc.service << 'EOF'
+cat > /etc/systemd/system/proxyveth.service << 'EOF'
 [Unit]
-Description=PSC — Proxy Control Service
+Description=ProxyVeth — Proxy Control Service
 After=network-online.target mproxy.service nodejs-server.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-EnvironmentFile=-/etc/psc/env
-ExecStart=/usr/bin/python3 /usr/local/bin/psc.py init
-ExecStart=/usr/bin/python3 /usr/local/bin/psc.py up all
-ExecStop=/usr/bin/python3 /usr/local/bin/psc.py down all
+EnvironmentFile=-/etc/proxyveth/env
+ExecStart=/usr/bin/python3 /usr/local/bin/proxyveth.py init
+ExecStart=/usr/bin/python3 /usr/local/bin/proxyveth.py up all
+ExecStop=/usr/bin/python3 /usr/local/bin/proxyveth.py down all
 TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat > /etc/systemd/system/psc-watchdog.service << 'EOF'
+cat > /etc/systemd/system/proxyveth-watchdog.service << 'EOF'
 [Unit]
-Description=PSC Watchdog
-After=psc.service
-Requires=psc.service
+Description=ProxyVeth Watchdog
+After=proxyveth.service
+Requires=proxyveth.service
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/psc/env
-ExecStart=/usr/bin/python3 /usr/local/bin/psc.py watchdog-loop
+EnvironmentFile=-/etc/proxyveth/env
+ExecStart=/usr/bin/python3 /usr/local/bin/proxyveth.py watchdog-loop
 Restart=always
 RestartSec=10
 
@@ -443,19 +443,19 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-cat > /etc/systemd/system/psc-autosync.service << 'EOF'
+cat > /etc/systemd/system/proxyveth-autosync.service << 'EOF'
 [Unit]
-Description=PSC Autosync
+Description=ProxyVeth Autosync
 
 [Service]
 Type=oneshot
-EnvironmentFile=-/etc/psc/env
-ExecStart=/usr/bin/python3 /usr/local/bin/psc.py autosync
+EnvironmentFile=-/etc/proxyveth/env
+ExecStart=/usr/bin/python3 /usr/local/bin/proxyveth.py autosync
 EOF
 
-cat > /etc/systemd/system/psc-autosync.timer << 'EOF'
+cat > /etc/systemd/system/proxyveth-autosync.timer << 'EOF'
 [Unit]
-Description=PSC Autosync every 5 min
+Description=ProxyVeth Autosync every 5 min
 
 [Timer]
 OnBootSec=3min
@@ -467,12 +467,12 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable psc.service psc-watchdog.service psc-autosync.timer
-systemctl start  psc-watchdog.service psc-autosync.timer
+systemctl enable proxyveth.service proxyveth-watchdog.service proxyveth-autosync.timer
+systemctl start  proxyveth-watchdog.service proxyveth-autosync.timer
 REMOTE
     ok "Systemd сервисы настроены"
     save_state
-    ok "PSC установлен"
+    ok "ProxyVeth установлен"
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -545,12 +545,12 @@ do_set_sheet() {
     prompt "SHEET_CSV_URL" "" URL
     [[ -n "${URL:-}" ]] || fail "Пусто"
     local ESCAPED_URL; ESCAPED_URL=$(printf '%s' "$URL" | sed 's/[&\]/\\&/g')
-    vm_exec "grep -q '^SHEET_CSV_URL=' /etc/psc/env \
-        && sed -i 's|^SHEET_CSV_URL=.*|SHEET_CSV_URL=${ESCAPED_URL}|' /etc/psc/env \
-        || echo 'SHEET_CSV_URL=${URL}' >> /etc/psc/env"
+    vm_exec "grep -q '^SHEET_CSV_URL=' /etc/proxyveth/env \
+        && sed -i 's|^SHEET_CSV_URL=.*|SHEET_CSV_URL=${ESCAPED_URL}|' /etc/proxyveth/env \
+        || echo 'SHEET_CSV_URL=${URL}' >> /etc/proxyveth/env"
     ok "URL сохранён"
     prompt "Запустить sync + up all? (yes/no)" "yes" _c
-    [[ "${_c:-}" == "yes" ]] && { vm_exec "psc sync && psc up all" && ok "Sync + Up выполнены" || warn "Ошибка sync"; }
+    [[ "${_c:-}" == "yes" ]] && { vm_exec "proxyveth sync && proxyveth up all" && ok "Sync + Up выполнены" || warn "Ошибка sync"; }
 }
 
 do_change_vm_params() {
@@ -593,18 +593,18 @@ do_set_ssh() {
 # ══════════════════════════════════════════════════════════════════
 #  MANAGE
 # ══════════════════════════════════════════════════════════════════
-do_psc_status()  { need_ip; vm_exec "psc status"  || warn "psc не отвечает"; }
-do_psc_check()   { need_ip; vm_exec "psc check"   || warn "psc не отвечает"; }
-do_psc_sync()    { need_ip; vm_exec "psc sync && psc up all" && ok "Sync + Up выполнены" || warn "Ошибка sync"; }
+do_proxyveth_status()  { need_ip; vm_exec "proxyveth status"  || warn "proxyveth не отвечает"; }
+do_proxyveth_check()   { need_ip; vm_exec "proxyveth check"   || warn "proxyveth не отвечает"; }
+do_proxyveth_sync()    { need_ip; vm_exec "proxyveth sync && proxyveth up all" && ok "Sync + Up выполнены" || warn "Ошибка sync"; }
 
-do_psc_restart() {
+do_proxyveth_restart() {
     need_ip
     prompt "Номер NS или all" "all" TARGET
-    vm_exec "psc restart ${TARGET}" && ok "Перезапущено: $TARGET" || warn "Ошибка restart"
+    vm_exec "proxyveth restart ${TARGET}" && ok "Перезапущено: $TARGET" || warn "Ошибка restart"
 }
-do_psc_logs() {
+do_proxyveth_logs() {
     need_ip; echo -e "\n  ${D}Ctrl+C для выхода${R}"
-    vm_exec "tail -f /etc/psc/logs/watchdog.log" || true
+    vm_exec "tail -f /etc/proxyveth/logs/watchdog.log" || true
 }
 
 do_reboot_vm() {
@@ -637,9 +637,9 @@ do_destroy_vm() {
     [[ "${_c:-}" == "DELETE" ]] || { echo "Отменено"; return; }
     qm stop "$VM_ID" --skiplock 2>/dev/null || true; sleep 3
     qm destroy "$VM_ID" --destroy-unreferenced-disks 1 --purge 1
-    rm -f "${PSC_DIR}/vm_${VM_ID}.conf"
-    local cur_active; cur_active=$(cat "${PSC_DIR}/active" 2>/dev/null || echo "")
-    [[ "$cur_active" == "$VM_ID" ]] && rm -f "${PSC_DIR}/active"
+    rm -f "${PROXYVETH_DIR}/vm_${VM_ID}.conf"
+    local cur_active; cur_active=$(cat "${PROXYVETH_DIR}/active" 2>/dev/null || echo "")
+    [[ "$cur_active" == "$VM_ID" ]] && rm -f "${PROXYVETH_DIR}/active"
     ok "VM удалена"
 }
 
@@ -680,22 +680,22 @@ menu_install() {
         echo -e "  ${D}──────────────────────────────────────────${R}"
         echo "  [1] Только VM"
         echo "  [2] Только Софт mp.space"
-        echo "  [3] Только PSC"
-        echo "  [4] VM + PSC"
+        echo "  [3] Только ProxyVeth"
+        echo "  [4] VM + ProxyVeth"
         echo "  [5] VM + Софт mp.space"
-        echo "  [6] PSC + Софт mp.space"
-        echo "  [7] Полный стек  (VM → PSC → mp.space)"
+        echo "  [6] ProxyVeth + Софт mp.space"
+        echo "  [7] Полный стек  (VM → ProxyVeth → mp.space)"
         echo "  [0] ← Назад"
         echo ""
         prompt_choice
         case ${CHOICE:-} in
             1) do_install_vm ;;
             2) do_install_mp ;;
-            3) do_install_psc ;;
-            4) do_install_vm; do_install_psc ;;
+            3) do_install_proxyveth ;;
+            4) do_install_vm; do_install_proxyveth ;;
             5) do_install_vm; do_install_mp ;;
-            6) do_install_psc; do_install_mp ;;
-            7) do_install_vm; do_install_psc; do_install_mp ;;
+            6) do_install_proxyveth; do_install_mp ;;
+            7) do_install_vm; do_install_proxyveth; do_install_mp ;;
             0) return ;;
             *) warn "Неверный выбор" ;;
         esac
@@ -731,10 +731,10 @@ menu_manage() {
         echo -e "\n${B}  Управление${R}  ${D}(VM: ${VM_ID:-?} @ ${VM_IP:-?})${R}"
         echo -e "  ${D}──────────────────────────────────────────${R}"
         echo "  [1] Dashboard"
-        echo "  [2] psc status   (NS + WAN IP)"
-        echo "  [3] psc check    (скорость + ping + 2ip)"
-        echo "  [4] psc sync + up all"
-        echo "  [5] psc restart  [N|all]"
+        echo "  [2] proxyveth status   (NS + WAN IP)"
+        echo "  [3] proxyveth check    (скорость + ping + 2ip)"
+        echo "  [4] proxyveth sync + up all"
+        echo "  [5] proxyveth restart  [N|all]"
         echo "  [6] Логи watchdog"
         echo "  [7] Сводка для ЛК mp.space"
         echo "  [8] Ребут VM"
@@ -745,11 +745,11 @@ menu_manage() {
         prompt_choice
         case ${CHOICE:-} in
             1) show_dashboard ;;
-            2) do_psc_status ;;
-            3) do_psc_check ;;
-            4) do_psc_sync ;;
-            5) do_psc_restart ;;
-            6) do_psc_logs ;;
+            2) do_proxyveth_status ;;
+            3) do_proxyveth_check ;;
+            4) do_proxyveth_sync ;;
+            5) do_proxyveth_restart ;;
+            6) do_proxyveth_logs ;;
             7) do_show_summary ;;
             8) do_reboot_vm ;;
             d|D) do_destroy_vm ;;
@@ -784,7 +784,7 @@ main_menu() {
 command -v qm    &>/dev/null  || fail "qm не найден — это не хост Proxmox"
 command -v pvesm &>/dev/null  || fail "pvesm не найден"
 
-mkdir -p "$PSC_DIR"
+mkdir -p "$PROXYVETH_DIR"
 load_state
 self_install_prompt
 main_menu

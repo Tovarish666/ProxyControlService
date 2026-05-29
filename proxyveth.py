@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PSC v1.0 — Proxy Control Service
+ProxyVeth — Proxy Control Service
 SOCKS5 → namespace + tun2socks → veth → mp.space source routing.
 """
 import os, sys, json, time, subprocess, csv, io, signal
@@ -10,12 +10,12 @@ from datetime import datetime
 SHEET_CSV_URL   = os.getenv("SHEET_CSV_URL", "")
 SHEET_ID        = os.getenv("SHEET_ID", "")
 SHEET_GID       = int(os.getenv("SHEET_GID", "0"))
-CONFIG_DIR      = Path(os.getenv("PSC_DIR", "/etc/psc"))
+CONFIG_DIR      = Path(os.getenv("PROXYVETH_DIR", "/etc/proxyveth"))
 CONFIG_FILE     = CONFIG_DIR / "config.json"
 ENV_FILE        = CONFIG_DIR / "env"
 LOG_DIR         = CONFIG_DIR / "logs"
 WATCHDOG_LOG    = LOG_DIR / "watchdog.log"
-SCRIPT_PATH     = Path("/usr/local/bin/psc.py")
+SCRIPT_PATH     = Path("/usr/local/bin/proxyveth.py")
 TUN2SOCKS_BIN   = "/usr/local/bin/tun2socks"
 TUN2SOCKS_VER   = "2.5.2"
 TUN2SOCKS_URL   = (f"https://github.com/xjasonlyu/tun2socks/releases/download/"
@@ -188,7 +188,7 @@ def _load_env_file():
 
 def load_config():
     if not CONFIG_FILE.exists():
-        log_fail(f"Конфиг не найден: {CONFIG_FILE}"); log_info("Запусти: psc sync"); sys.exit(1)
+        log_fail(f"Конфиг не найден: {CONFIG_FILE}"); log_info("Запусти: proxyveth sync"); sys.exit(1)
     return json.loads(CONFIG_FILE.read_text())
 
 def save_config(data):
@@ -263,7 +263,7 @@ def cmd_install():
     run("apt update -qq", capture=True)
     run("apt install -y -qq wget unzip curl iproute2 iptables python3", capture=True)
     log_ok("Пакеты установлены")
-    Path("/etc/sysctl.d/99-psc.conf").write_text("net.ipv4.ip_forward = 1\n")
+    Path("/etc/sysctl.d/99-proxyveth.conf").write_text("net.ipv4.ip_forward = 1\n")
     run("sysctl -w net.ipv4.ip_forward=1", capture=True); log_ok("ip_forward=1")
     if not Path("/dev/net/tun").exists(): log_fail("/dev/net/tun не найден!")
     else: log_ok("/dev/net/tun OK")
@@ -409,7 +409,7 @@ def cmd_watchdog():
     ok,re,fa=watchdog_pass(config,1); log_info(f"OK:{ok} Restart:{re} Fail:{fa}")
 
 def cmd_watchdog_loop():
-    wlog("PSC WATCHDOG STARTED"); stop=[False]
+    wlog("PROXYVETH WATCHDOG STARTED"); stop=[False]
     signal.signal(signal.SIGTERM, lambda s,f: stop.__setitem__(0,True))
     signal.signal(signal.SIGINT,  lambda s,f: stop.__setitem__(0,True))
     config=load_config(); p=0
@@ -423,7 +423,7 @@ def cmd_watchdog_loop():
         for _ in range(WATCHDOG_INTERVAL):
             if stop[0]: break
             time.sleep(1)
-    wlog("PSC WATCHDOG STOPPED")
+    wlog("PROXYVETH WATCHDOG STOPPED")
 
 def cmd_status():
     """Таблица NS + WAN IP (всегда с wan)."""
@@ -531,8 +531,8 @@ def cmd_show_config():
 
 def setup_systemd():
     header("SYSTEMD"); py="/usr/bin/python3"; script=str(SCRIPT_PATH); envf=str(ENV_FILE)
-    Path("/etc/systemd/system/psc.service").write_text(f"""[Unit]
-Description=PSC — Proxy Control Service
+    Path("/etc/systemd/system/proxyveth.service").write_text(f"""[Unit]
+Description=ProxyVeth — Proxy Control Service
 After=network-online.target mproxy.service nodejs-server.service
 Wants=network-online.target
 [Service]
@@ -546,10 +546,10 @@ TimeoutStartSec=300
 [Install]
 WantedBy=multi-user.target
 """)
-    Path("/etc/systemd/system/psc-watchdog.service").write_text(f"""[Unit]
-Description=PSC Watchdog
-After=psc.service
-Requires=psc.service
+    Path("/etc/systemd/system/proxyveth-watchdog.service").write_text(f"""[Unit]
+Description=ProxyVeth Watchdog
+After=proxyveth.service
+Requires=proxyveth.service
 [Service]
 Type=simple
 EnvironmentFile=-{envf}
@@ -559,15 +559,15 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 """)
-    Path("/etc/systemd/system/psc-autosync.service").write_text(f"""[Unit]
-Description=PSC Autosync
+    Path("/etc/systemd/system/proxyveth-autosync.service").write_text(f"""[Unit]
+Description=ProxyVeth Autosync
 [Service]
 Type=oneshot
 EnvironmentFile=-{envf}
 ExecStart={py} {script} autosync
 """)
-    Path("/etc/systemd/system/psc-autosync.timer").write_text("""[Unit]
-Description=PSC Autosync Timer
+    Path("/etc/systemd/system/proxyveth-autosync.timer").write_text("""[Unit]
+Description=ProxyVeth Autosync Timer
 [Timer]
 OnBootSec=3min
 OnUnitActiveSec=5min
@@ -576,14 +576,14 @@ Persistent=true
 WantedBy=timers.target
 """)
     run("systemctl daemon-reload", capture=True)
-    run("systemctl enable psc.service", capture=True)
-    run("systemctl enable psc-watchdog.service", capture=True)
-    run("systemctl enable psc-autosync.timer", capture=True)
+    run("systemctl enable proxyveth.service", capture=True)
+    run("systemctl enable proxyveth-watchdog.service", capture=True)
+    run("systemctl enable proxyveth-autosync.timer", capture=True)
     log_ok("Все сервисы enabled")
 
 def cmd_setup():
     global SHEET_CSV_URL
-    header("PSC — УСТАНОВКА")
+    header("PROXYVETH — УСТАНОВКА")
     if not SHEET_CSV_URL and not SHEET_ID:
         print(f"\n  {Y}SHEET_CSV_URL не задан.{R}")
         url=input("  Введи CSV ссылку на Google Sheet: ").strip()
@@ -593,16 +593,16 @@ def cmd_setup():
         log_ok(f"Сохранено в {ENV_FILE}"); os.environ["SHEET_CSV_URL"]=url
         SHEET_CSV_URL=url
     cmd_install(); config=do_sync(); cmd_init(); cmd_up("all"); setup_systemd()
-    link=Path("/usr/local/bin/psc"); link.unlink(missing_ok=True); link.symlink_to(SCRIPT_PATH)
-    log_ok("Symlink: psc → psc.py")
+    link=Path("/usr/local/bin/proxyveth"); link.unlink(missing_ok=True); link.symlink_to(SCRIPT_PATH)
+    log_ok("Symlink: proxyveth → proxyveth.py")
     active=len(get_active_ns_list()); enabled=len(get_enabled_modems(config))
     wan_ip=run_safe("curl -s --max-time 5 2ip.ru",capture=True).stdout.strip()
     loc_ip=run_safe("hostname -I",capture=True).stdout.split()[0]
     print(f"""
 {G}{'═'*60}
-  PSC УСТАНОВЛЕН: {active}/{enabled} NS активно
+  PROXYVETH УСТАНОВЛЕН: {active}/{enabled} NS активно
 {'═'*60}{R}
-  psc status / check / restart N / down all
+  proxyveth status / check / restart N / down all
 
   {Y}⚠ Настрой в ЛК mobileproxy.space → Сервера → ✏{R}
     Статический IP : {wan_ip}
@@ -610,7 +610,7 @@ def cmd_setup():
     Root login     : root   |   OS: Unix
 """)
 
-USAGE=f"""{B}PSC v1.0 — Proxy Control Service{R}
+USAGE=f"""{B}ProxyVeth — Proxy Control Service{R}
 Команды: sync / autosync / init / up [N|all] / down [N|all]
          restart [N|all] / status / check
          watchdog / watchdog-loop / cleanup / show-config
@@ -628,13 +628,13 @@ def main():
     try:
         if cmd in dispatch: dispatch[cmd]()
         elif cmd=="up":
-            if not arg: log_fail("psc up [N|all]"); sys.exit(1)
+            if not arg: log_fail("proxyveth up [N|all]"); sys.exit(1)
             cmd_up(arg)
         elif cmd=="down":
-            if not arg: log_fail("psc down [N|all]"); sys.exit(1)
+            if not arg: log_fail("proxyveth down [N|all]"); sys.exit(1)
             cmd_down(arg)
         elif cmd=="restart":
-            if not arg: log_fail("psc restart [N|all]"); sys.exit(1)
+            if not arg: log_fail("proxyveth restart [N|all]"); sys.exit(1)
             cmd_restart(arg)
         elif cmd=="status": cmd_status()
         elif cmd=="check":  cmd_check()
