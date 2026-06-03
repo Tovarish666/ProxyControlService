@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ProxyVethMP v1.0
+ProxyVeth v1.0
 SOCKS5 → namespace + tun2socks → veth → mp.space source routing.
 """
 import os, sys, json, time, subprocess, csv, io, signal
@@ -10,12 +10,12 @@ from datetime import datetime
 SHEET_CSV_URL   = os.getenv("SHEET_CSV_URL", "")
 SHEET_ID        = os.getenv("SHEET_ID", "")
 SHEET_GID       = int(os.getenv("SHEET_GID", "0"))
-CONFIG_DIR      = Path(os.getenv("PROXYVETHMP_DIR", "/etc/proxyvethmp"))
+CONFIG_DIR      = Path(os.getenv("PROXYVETH_DIR", "/etc/proxyveth"))
 CONFIG_FILE     = CONFIG_DIR / "config.json"
 ENV_FILE        = CONFIG_DIR / "env"
 LOG_DIR         = CONFIG_DIR / "logs"
 WATCHDOG_LOG    = LOG_DIR / "watchdog.log"
-SCRIPT_PATH     = Path("/usr/local/bin/proxyveth_mp.py")
+SCRIPT_PATH     = Path("/usr/local/bin/proxyveth.py")
 TUN2SOCKS_BIN   = "/usr/local/bin/tun2socks"
 TUN2SOCKS_VER   = "2.5.2"
 TUN2SOCKS_URL   = (f"https://github.com/xjasonlyu/tun2socks/releases/download/"
@@ -168,7 +168,7 @@ def cmd_install():
     run("apt update -qq", capture=True)
     run("apt install -y -qq wget unzip curl iproute2 iptables python3", capture=True)
     log_ok("Пакеты установлены")
-    Path("/etc/sysctl.d/99-proxyvethmp.conf").write_text("net.ipv4.ip_forward = 1\n")
+    Path("/etc/sysctl.d/99-proxyveth.conf").write_text("net.ipv4.ip_forward = 1\n")
     run("sysctl -w net.ipv4.ip_forward=1", capture=True); log_ok("ip_forward=1")
     if not Path("/dev/net/tun").exists(): log_fail("/dev/net/tun не найден!")
     else: log_ok("/dev/net/tun OK")
@@ -314,7 +314,7 @@ def cmd_watchdog():
     ok,re,fa=watchdog_pass(config,1); log_info(f"OK:{ok} Restart:{re} Fail:{fa}")
 
 def cmd_watchdog_loop():
-    wlog("ProxyVethMP WATCHDOG STARTED"); stop=[False]
+    wlog("ProxyVeth WATCHDOG STARTED"); stop=[False]
     signal.signal(signal.SIGTERM, lambda s,f: stop.__setitem__(0,True))
     signal.signal(signal.SIGINT,  lambda s,f: stop.__setitem__(0,True))
     config=load_config(); p=0
@@ -328,7 +328,7 @@ def cmd_watchdog_loop():
         for _ in range(WATCHDOG_INTERVAL):
             if stop[0]: break
             time.sleep(1)
-    wlog("ProxyVethMP WATCHDOG STOPPED")
+    wlog("ProxyVeth WATCHDOG STOPPED")
 
 def cmd_status(check_wan=False):
     header("STATUS"); config=load_config(); modems=config.get("modems",{}); active_ns=set(get_active_ns_list())
@@ -410,8 +410,8 @@ def cmd_show_config():
 
 def setup_systemd():
     header("SYSTEMD"); py="/usr/bin/python3"; script=str(SCRIPT_PATH); envf=str(ENV_FILE)
-    Path("/etc/systemd/system/proxyvethmp.service").write_text(f"""[Unit]
-Description=ProxyVethMP
+    Path("/etc/systemd/system/proxyveth.service").write_text(f"""[Unit]
+Description=ProxyVeth
 After=network-online.target mproxy.service nodejs-server.service
 Wants=network-online.target
 [Service]
@@ -425,10 +425,10 @@ TimeoutStartSec=300
 [Install]
 WantedBy=multi-user.target
 """)
-    Path("/etc/systemd/system/proxyvethmp-watchdog.service").write_text(f"""[Unit]
-Description=ProxyVethMP Watchdog
-After=proxyvethmp.service
-Requires=proxyvethmp.service
+    Path("/etc/systemd/system/proxyveth-watchdog.service").write_text(f"""[Unit]
+Description=ProxyVeth Watchdog
+After=proxyveth.service
+Requires=proxyveth.service
 [Service]
 Type=simple
 EnvironmentFile=-{envf}
@@ -438,15 +438,15 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 """)
-    Path("/etc/systemd/system/proxyvethmp-autosync.service").write_text(f"""[Unit]
-Description=ProxyVethMP Autosync
+    Path("/etc/systemd/system/proxyveth-autosync.service").write_text(f"""[Unit]
+Description=ProxyVeth Autosync
 [Service]
 Type=oneshot
 EnvironmentFile=-{envf}
 ExecStart={py} {script} autosync
 """)
-    Path("/etc/systemd/system/proxyvethmp-autosync.timer").write_text("""[Unit]
-Description=ProxyVethMP Autosync Timer
+    Path("/etc/systemd/system/proxyveth-autosync.timer").write_text("""[Unit]
+Description=ProxyVeth Autosync Timer
 [Timer]
 OnBootSec=3min
 OnUnitActiveSec=5min
@@ -455,14 +455,14 @@ Persistent=true
 WantedBy=timers.target
 """)
     run("systemctl daemon-reload", capture=True)
-    run("systemctl enable proxyvethmp.service", capture=True)
-    run("systemctl enable proxyvethmp-watchdog.service", capture=True)
-    run("systemctl enable proxyvethmp-autosync.timer", capture=True)
+    run("systemctl enable proxyveth.service", capture=True)
+    run("systemctl enable proxyveth-watchdog.service", capture=True)
+    run("systemctl enable proxyveth-autosync.timer", capture=True)
     log_ok("Все сервисы enabled")
 
 def cmd_setup():
     global SHEET_CSV_URL
-    header("ProxyVethMP — УСТАНОВКА")
+    header("ProxyVeth — УСТАНОВКА")
     if not SHEET_CSV_URL and not SHEET_ID:
         print(f"\n  {Y}SHEET_CSV_URL не задан.{R}")
         url=input("  Введи CSV ссылку на Google Sheet: ").strip()
@@ -473,13 +473,13 @@ def cmd_setup():
         SHEET_CSV_URL=url
     cmd_install(); config=do_sync(); cmd_init(); cmd_up("all"); setup_systemd()
     link=Path("/usr/local/bin/proxyveth"); link.unlink(missing_ok=True); link.symlink_to(SCRIPT_PATH)
-    log_ok("Symlink: proxyveth → proxyveth_mp.py")
+    log_ok("Symlink: proxyveth → proxyveth.py")
     active=len(get_active_ns_list()); enabled=len(get_enabled_modems(config))
     wan_ip=run_safe("curl -s --max-time 5 2ip.ru",capture=True).stdout.strip()
     loc_ip=run_safe("hostname -I",capture=True).stdout.split()[0]
     print(f"""
 {G}{'═'*60}
-  ProxyVethMP УСТАНОВЛЕН: {active}/{enabled} NS активно
+  ProxyVeth УСТАНОВЛЕН: {active}/{enabled} NS активно
 {'═'*60}{R}
   proxyveth status / check N / restart N / down all
 
@@ -489,7 +489,7 @@ def cmd_setup():
     Root login     : root   |   OS: Unix
 """)
 
-USAGE=f"""{B}ProxyVethMP v1.0{R}
+USAGE=f"""{B}ProxyVeth v1.0{R}
 Команды: sync / autosync / init / up [N|all] / down [N|all]
          restart [N|all] / status [--wan] / check N
          watchdog / watchdog-loop / cleanup / show-config"""
