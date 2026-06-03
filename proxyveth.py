@@ -189,7 +189,7 @@ def cmd_init():
 
 def ns_up(n, modem):
     ph=modem["proxy_host"]; pp=modem["proxy_port"]
-    proxy_url=f"socks5://{modem['login']}:{modem['password']}@{ph}:{pp}"
+    proxy_url=f"socks5h://{modem['login']}:{modem['password']}@{ph}:{pp}"
     rt_table=RT_TABLE_BASE+n
     print(f"\n  {B}── NS {n} ──{R}  {ph}:{pp}")
     if is_ns_exists(n): log_warn(f"ns_{n} уже существует — пропуск"); return True
@@ -475,7 +475,7 @@ def cmd_setup():
     link=Path("/usr/local/bin/proxyveth"); link.unlink(missing_ok=True); link.symlink_to(SCRIPT_PATH)
     log_ok("Symlink: proxyveth → proxyveth.py")
     active=len(get_active_ns_list()); enabled=len(get_enabled_modems(config))
-    wan_ip=run_safe("curl -s --max-time 5 2ip.ru",capture=True).stdout.strip()
+    wan_ip = run_safe(f"curl -s --max-time 5 2ip.ru", ns=n, capture=True).stdout.strip()
     loc_ip=run_safe("hostname -I",capture=True).stdout.split()[0]
     print(f"""
 {G}{'═'*60}
