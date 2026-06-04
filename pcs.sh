@@ -374,8 +374,11 @@ apt-get update -qq && apt-get upgrade -y -qq
 apt-get install -y -qq curl wget mc net-tools
 hostnamectl set-hostname ${VM_NAME}
 grep -q '${VM_NAME}' /etc/hosts || echo '127.0.1.1 ${VM_NAME}' >> /etc/hosts
+rm -f /etc/resolv.conf
+printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' > /etc/resolv.conf
+chattr +i /etc/resolv.conf
 "
-    ok "Ubuntu настроена"
+    ok "Ubuntu настроена (DNS зафиксирован: 8.8.8.8)"
     save_state
     echo -e "\n  ${G}VM готова!${R}  ID: ${VM_ID}  IP: ${VM_IP}"
 }
