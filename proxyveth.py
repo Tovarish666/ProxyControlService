@@ -201,7 +201,9 @@ def _write_singbox_config(n, modem):
             "address": [f"10.0.{n}.1/30"],
             "mtu": 1500,
             "auto_route": False,
-            "stack": "system"
+            "stack": "system",
+            "sniff": True,
+            "sniff_override_destination": True
         }],
         "outbounds": [{
             "type": "socks",
