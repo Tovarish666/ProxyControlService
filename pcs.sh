@@ -146,11 +146,14 @@ select_vm() {
     # Загружаем конфиг если есть
     if [[ -f "${PCS_DIR}/vm_${VM_ID}.conf" ]]; then
         source "${PCS_DIR}/vm_${VM_ID}.conf"
+        prompt "IP VM" "${VM_IP:-}" VM_IP
+        save_state
         ok "Активная VM: ${VM_ID} (${VM_NAME}) @ ${VM_IP:-?}"
     else
         VM_NAME="proxyveth"; VM_IP=""; VM_BRIDGE="vmbr0"
-        # Попробуем подхватить имя из qm
         VM_NAME=$(qm config "$VM_ID" 2>/dev/null | awk '/^name:/{print $2}' || echo "proxyveth")
+        prompt "IP VM" "" VM_IP
+        save_state
         warn "Новая VM для pcs — конфиг будет создан после установки"
     fi
     echo "$VM_ID" > "${PCS_DIR}/active"
@@ -744,6 +747,7 @@ menu_config() {
         echo "  [3] Параметры VM  (RAM / CPU)"
         echo "  [4] Root пароль VM"
         echo "  [5] SSH настройки"
+        echo "  [6] IP адрес VM  (если изменился)"
         echo "  [0] ← Назад"
         echo ""
         prompt_choice
@@ -753,6 +757,7 @@ menu_config() {
             3) do_change_vm_params ;;
             4) do_change_password ;;
             5) do_set_ssh ;;
+            6) load_state; prompt "Новый IP VM" "${VM_IP:-}" VM_IP; save_state; ok "IP обновлён: ${VM_IP}" ;;
             0) return ;;
             *) warn "Неверный выбор" ;;
         esac
