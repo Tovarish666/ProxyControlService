@@ -328,7 +328,8 @@ def watchdog_check_ns(n, modem, check_wan=False):
     if not is_ns_exists(n): return "ns_missing"
     if not is_process_running(f"sing-box.*modem_{n}\\.json"): return "tun_dead"
     if check_wan:
-        r=run_safe(f"curl -s --max-time {CURL_TIMEOUT} --interface 192.168.{n}.100 2ip.ru", capture=True, quiet=True)
+        r=run_safe(f"curl -s --max-time {CURL_TIMEOUT} http://ip-api.com/line/?fields=query",
+                   ns=n, capture=True, quiet=True)
         if r.returncode!=0 or not r.stdout.strip(): return "wan_dead"
     return "ok"
 
@@ -375,8 +376,9 @@ def cmd_watchdog_loop():
 
 def cmd_status(check_wan=False):
     header("STATUS"); config=load_config(); modems=config.get("modems",{}); active_ns=set(get_active_ns_list())
-    print(f"\n  {'N':>3} │ {'Proxy':^28} │ {'NS':^6} │ {'sb':^5}{'  WAN IP' if check_wan else ''}")
-    print(f"  {'─'*3}─┼─{'─'*28}─┼─{'─'*6}─┼─{'─'*5}")
+    wh = "  WAN IP" if check_wan else ""
+    print(f"\n  {'N':>3} │ {'Proxy':^28} │ {'NS':^6} │ {'sb':^5}{wh}")
+    print(f"  {'─'*3}─┼─{'─'*28}─┼─{'─'*6}─┼─{'─'*5}{'─┼─' + '─'*15 if check_wan else ''}")
     up=down=disabled=0
     for n_str in sorted(modems,key=lambda x:int(x)):
         n=int(n_str); m=modems[n_str]; en=m.get("enabled",True); ps=f"{m['proxy_host']}:{m['proxy_port']}"
@@ -385,26 +387,13 @@ def cmd_status(check_wan=False):
             up+=1; ns_m=f"{G}{'UP':^6}{R}"; t=is_process_running(f"sing-box.*modem_{n}\\.json"); tm=f"{G}{'✓':^5}{R}" if t else f"{RD}{'✗':^5}{R}"
             w=""
             if check_wan:
-                wr=run_safe(f"curl -s --max-time {CURL_TIMEOUT} --interface 192.168.{n}.100 2ip.ru", capture=True, quiet=True)
-                w=f"  {wr.stdout.strip() if wr.returncode==0 else '—'}"
-        else: down+=1; ns_m=f"{RD}{'DOWN':^6}{R}"; tm=f"{D}{'—':^5}{R}"; w=""
+                wr=run_safe(f"curl -s --max-time {CURL_TIMEOUT} http://ip-api.com/line/?fields=query",
+                            ns=n, capture=True, quiet=True)
+                w=f" │  {(wr.stdout.strip() if wr.returncode==0 else '—'):<15}"
+        else: down+=1; ns_m=f"{RD}{'DOWN':^6}{R}"; tm=f"{D}{'—':^5}{R}"; w=f" │  {'—':<15}" if check_wan else ""
         print(f"  {n:>3} │ {ps:<28} │ {ns_m} │ {tm}{w}")
     print(); log_info(f"UP:{up} DOWN:{down} Disabled:{disabled} Total:{len(modems)}")
     if config.get("last_sync"): log_info(f"Sync: {config['last_sync']}")
-
-def cmd_check(target):
-    n=int(target); header(f"CHECK ns_{n}")
-    if not is_ns_exists(n): log_fail(f"ns_{n} не существует"); return
-    r=run_safe(f"curl -s --max-time {CURL_TIMEOUT} --interface 192.168.{n}.100 2ip.ru", capture=True, quiet=True)
-    (log_ok if r.returncode==0 and r.stdout.strip() else log_fail)(f"WAN IP (хост):  {r.stdout.strip() or 'недоступен'}")
-    r=run_safe(f"curl -s --max-time {CURL_TIMEOUT} 2ip.ru", ns=n, capture=True, quiet=True)
-    (log_ok if r.returncode==0 and r.stdout.strip() else log_fail)(f"WAN IP (ns):    {r.stdout.strip() or 'недоступен'}")
-    r=run_safe(f"curl -s --max-time 5 --interface 192.168.{n}.100 http://192.168.{n}.1/api/webserver/SesTokInfo", capture=True, quiet=True)
-    (log_ok if "SesInfo" in r.stdout else log_fail)(f"Huawei API .1:  {'OK' if 'SesInfo' in r.stdout else 'недоступен'}")
-    t=is_process_running(f"sing-box.*modem_{n}\\.json")
-    (log_ok if t else log_fail)(f"sing-box:       {'OK' if t else 'DEAD'}")
-    log_step("Маршруты в ns:")
-    for line in run_safe("ip route",ns=n,capture=True).stdout.strip().split("\n"): print(f"    {D}{line}{R}")
 
 def cmd_up(target):
     config=load_config(); cmd_init()
@@ -526,7 +515,7 @@ def cmd_setup():
 {G}{'═'*60}
   ProxyVeth УСТАНОВЛЕН: {active}/{enabled} NS активно
 {'═'*60}{R}
-  proxyveth status / check N / restart N / down all
+  proxyveth status / status --wan / restart N / down all
 
   {Y}⚠ Настрой в ЛК mobileproxy.space → Сервера → ✏{R}
     Статический IP : {wan_ip}
@@ -536,7 +525,7 @@ def cmd_setup():
 
 USAGE=f"""{B}ProxyVeth v2.0{R}
 Команды: sync / autosync / init / up [N|all] / down [N|all]
-         restart [N|all] / status [--wan] / check N
+         restart [N|all] / status [--wan]
          watchdog / watchdog-loop / cleanup / show-config"""
 
 def main():
@@ -558,9 +547,6 @@ def main():
             if not arg: log_fail("proxyveth restart [N|all]"); sys.exit(1)
             cmd_restart(arg)
         elif cmd=="status": cmd_status(check_wan="--wan" in flags)
-        elif cmd=="check":
-            if not arg: log_fail("proxyveth check N"); sys.exit(1)
-            cmd_check(arg)
         else: log_fail(f"Неизвестная команда: {cmd}"); print(USAGE); sys.exit(1)
     except KeyboardInterrupt: print(f"\n{Y}Прервано{R}"); sys.exit(130)
     except SystemExit: raise
