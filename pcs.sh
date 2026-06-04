@@ -416,7 +416,7 @@ do_install_proxyveth() {
     fi
 
     vm_wait_apt
-    step "Установка зависимостей (tun2socks)..."
+    step "Установка зависимостей (sing-box)..."
     vm_exec "proxyveth install"
     ok "Зависимости установлены"
 

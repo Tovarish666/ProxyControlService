@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ProxyVeth v1.0
-SOCKS5 → namespace + tun2socks → veth → mp.space source routing.
+ProxyVeth v2.0
+SOCKS5 → namespace + sing-box → veth → mp.space source routing.
 """
 import os, sys, json, time, subprocess, csv, io, signal
 from pathlib import Path
@@ -16,15 +16,16 @@ ENV_FILE        = CONFIG_DIR / "env"
 LOG_DIR         = CONFIG_DIR / "logs"
 WATCHDOG_LOG    = LOG_DIR / "watchdog.log"
 SCRIPT_PATH     = Path("/usr/local/bin/proxyveth.py")
-TUN2SOCKS_BIN   = "/usr/local/bin/tun2socks"
-TUN2SOCKS_VER   = "2.5.2"
-TUN2SOCKS_URL   = (f"https://github.com/xjasonlyu/tun2socks/releases/download/"
-                   f"v{TUN2SOCKS_VER}/tun2socks-linux-amd64.zip")
+SINGBOX_BIN     = "/usr/local/bin/sing-box"
+SINGBOX_VER     = os.getenv("SINGBOX_VER", "1.10.0")
+SINGBOX_URL     = (f"https://github.com/SagerNet/sing-box/releases/download/"
+                   f"v{SINGBOX_VER}/sing-box-{SINGBOX_VER}-linux-amd64.tar.gz")
+SINGBOX_CONF_DIR = CONFIG_DIR / "singbox"
 ETH_WAN         = "eth0"
 DNS_SERVERS     = ["8.8.8.8", "8.8.4.4"]
 DNS_SERVER      = "8.8.8.8"
 RT_TABLE_BASE   = 100
-TUN2SOCKS_WAIT  = 3
+SINGBOX_TIMEOUT = 8
 CURL_TIMEOUT    = 10
 WATCHDOG_INTERVAL    = int(os.getenv("WATCHDOG_INTERVAL",    "60"))
 WATCHDOG_WAN_EVERY   = int(os.getenv("WATCHDOG_WAN_EVERY",   "10"))
@@ -166,30 +167,69 @@ def do_sync(quiet=False):
 def cmd_install():
     header("INSTALL")
     run("apt update -qq", capture=True)
-    run("apt install -y -qq wget unzip curl iproute2 iptables python3", capture=True)
+    run("apt install -y -qq wget curl iproute2 iptables python3", capture=True)
     log_ok("Пакеты установлены")
     Path("/etc/sysctl.d/99-proxyveth.conf").write_text("net.ipv4.ip_forward = 1\n")
     run("sysctl -w net.ipv4.ip_forward=1", capture=True); log_ok("ip_forward=1")
     if not Path("/dev/net/tun").exists(): log_fail("/dev/net/tun не найден!")
     else: log_ok("/dev/net/tun OK")
-    if Path(TUN2SOCKS_BIN).exists(): log_ok("tun2socks уже есть")
+    if Path(SINGBOX_BIN).exists(): log_ok(f"sing-box уже есть")
     else:
-        log_step(f"Скачиваем tun2socks v{TUN2SOCKS_VER}...")
-        run(f"wget -q -O /tmp/tun2socks.zip '{TUN2SOCKS_URL}'", capture=True)
-        run("unzip -o /tmp/tun2socks.zip -d /tmp/", capture=True)
-        run(f"mv /tmp/tun2socks-linux-amd64 {TUN2SOCKS_BIN}")
-        run(f"chmod +x {TUN2SOCKS_BIN}"); run("rm -f /tmp/tun2socks.zip")
-        log_ok(f"tun2socks v{TUN2SOCKS_VER} установлен")
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True); LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_step(f"Скачиваем sing-box v{SINGBOX_VER}...")
+        run(f"wget -q -O /tmp/sing-box.tar.gz '{SINGBOX_URL}'", capture=True)
+        run(f"tar -xzf /tmp/sing-box.tar.gz -C /tmp/", capture=True)
+        run(f"mv /tmp/sing-box-{SINGBOX_VER}-linux-amd64/sing-box {SINGBOX_BIN}")
+        run(f"chmod +x {SINGBOX_BIN}")
+        run(f"rm -rf /tmp/sing-box.tar.gz /tmp/sing-box-{SINGBOX_VER}-linux-amd64")
+        log_ok(f"sing-box v{SINGBOX_VER} установлен")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    SINGBOX_CONF_DIR.mkdir(parents=True, exist_ok=True)
 
 def cmd_init():
     header("INIT")
     if not Path("/dev/net/tun").exists(): log_fail("/dev/net/tun не найден!"); sys.exit(1)
     run("sysctl -w net.ipv4.ip_forward=1", capture=True); log_ok("ip_forward=1"); log_ok("INIT готов")
 
+def _write_singbox_config(n, modem):
+    conf = {
+        "log": {"disabled": True},
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": f"tun{n}",
+            "address": [f"10.0.{n}.1/30"],
+            "mtu": 1500,
+            "auto_route": False,
+            "stack": "system"
+        }],
+        "outbounds": [{
+            "type": "socks",
+            "tag": "proxy",
+            "server": modem["proxy_host"],
+            "server_port": modem["proxy_port"],
+            "username": modem["login"],
+            "password": modem["password"],
+            "version": "5"
+        }],
+        "route": {"final": "proxy"}
+    }
+    SINGBOX_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    path = SINGBOX_CONF_DIR / f"modem_{n}.json"
+    path.write_text(json.dumps(conf, indent=2))
+    return path
+
+def _wait_tun_addr(n, timeout=SINGBOX_TIMEOUT):
+    # sing-box assigns the address itself; poll until it appears
+    for _ in range(timeout * 2):
+        r = run_safe(f"ip addr show tun{n}", ns=n, quiet=True)
+        if r.returncode == 0 and f"10.0.{n}.1" in r.stdout:
+            return True
+        time.sleep(0.5)
+    return False
+
 def ns_up(n, modem):
     ph=modem["proxy_host"]; pp=modem["proxy_port"]
-    proxy_url=f"socks5h://{modem['login']}:{modem['password']}@{ph}:{pp}"
     rt_table=RT_TABLE_BASE+n
     print(f"\n  {B}── NS {n} ──{R}  {ph}:{pp}")
     if is_ns_exists(n): log_warn(f"ns_{n} уже существует — пропуск"); return True
@@ -207,23 +247,23 @@ def ns_up(n, modem):
         run(f"ip addr add 192.168.{n}.254/24 dev veth_ext{n}_ns", ns=n)
         run(f"ip link set veth_ext{n}_ns up", ns=n)
         log_step(f"ns_{n}: veth OK")
-        # 3. tun2socks
-        run(f"nohup {TUN2SOCKS_BIN} -device tun{n} -proxy {proxy_url} -loglevel silent > /dev/null 2>&1 &",
+        # 3. sing-box: пишем конфиг, запускаем внутри ns
+        # credentials в файле — не торчат в ps aux, в отличие от tun2socks
+        conf_path = _write_singbox_config(n, modem)
+        run(f"nohup {SINGBOX_BIN} run -c {conf_path} > /dev/null 2>&1 &",
             ns=n, capture=False)
-        time.sleep(TUN2SOCKS_WAIT)
-        if run_safe(f"ip link show tun{n}", ns=n, quiet=True).returncode!=0:
-            raise RuntimeError(f"tun{n} не создан")
-        run(f"ip addr add 10.0.{n}.1/30 dev tun{n}", ns=n)
-        run(f"ip link set tun{n} up", ns=n)
-        log_step(f"ns_{n}: tun2socks OK")
-        # 4. Маршруты в ns
+        # sing-box сам создаёт tun{n}, назначает 10.0.N.1/30 и поднимает интерфейс
+        if not _wait_tun_addr(n):
+            raise RuntimeError(f"tun{n} не поднят sing-box за {SINGBOX_TIMEOUT}с")
+        log_step(f"ns_{n}: sing-box OK")
+        # 4. Маршруты в ns (адрес уже выставлен sing-box, ip addr add не нужен)
         run(f"ip route add default dev tun{n}", ns=n)
         run(f"ip route add 192.168.{n}.1/32 dev tun{n}", ns=n)        # Huawei API
         run(f"ip route add {ph}/32 via 192.168.{n}.100", ns=n)        # SOCKS5 bypass tun!
         for dns in DNS_SERVERS:
             run_safe(f"ip route add {dns}/32 via 192.168.{n}.100", ns=n)  # DNS bypass tun!
         # 5. iptables в ns
-        # КРИТИЧНО: UDP DROP — без него mproxy флудит через tun2socks → убивает 3proxy
+        # КРИТИЧНО: UDP DROP — без него mproxy флудит через sing-box → убивает 3proxy
         run(f"iptables -A OUTPUT  -o tun{n} -p udp -j DROP", ns=n)
         run(f"iptables -A FORWARD -o tun{n} -p udp -j DROP", ns=n)
         run("sysctl -w net.ipv4.ip_forward=1", ns=n)
@@ -245,8 +285,7 @@ def ns_up(n, modem):
 def ns_down(n, quiet=False):
     if not quiet: print(f"  {D}↓ ns_{n}{R}", end="", flush=True)
     rt_table=RT_TABLE_BASE+n
-    run_safe(f"pkill -f 'tun2socks.*tun{n}[^0-9]'", quiet=True)
-    run_safe(f"pkill -f 'tun2socks.*tun{n}$'", quiet=True)
+    run_safe(f"pkill -f 'sing-box run -c.*modem_{n}\\.json'", quiet=True)
     time.sleep(0.3)
     run_safe(f"ip netns del ns_{n}", quiet=True)
     run_safe(f"ip link del veth_ext{n}_host", quiet=True)
@@ -257,6 +296,8 @@ def ns_down(n, quiet=False):
     if dns_dir.exists():
         for f in dns_dir.iterdir(): f.unlink()
         dns_dir.rmdir()
+    conf = SINGBOX_CONF_DIR / f"modem_{n}.json"
+    conf.unlink(missing_ok=True)
     if not quiet: print(f" {G}✓{R}")
 
 def cmd_autosync():
@@ -283,7 +324,7 @@ def cmd_autosync():
 
 def watchdog_check_ns(n, modem, check_wan=False):
     if not is_ns_exists(n): return "ns_missing"
-    if not is_process_running(f"tun2socks.*tun{n}"): return "tun_dead"
+    if not is_process_running(f"sing-box.*modem_{n}\\.json"): return "tun_dead"
     if check_wan:
         r=run_safe(f"curl -s --max-time {CURL_TIMEOUT} --interface 192.168.{n}.100 2ip.ru", capture=True, quiet=True)
         if r.returncode!=0 or not r.stdout.strip(): return "wan_dead"
@@ -332,14 +373,14 @@ def cmd_watchdog_loop():
 
 def cmd_status(check_wan=False):
     header("STATUS"); config=load_config(); modems=config.get("modems",{}); active_ns=set(get_active_ns_list())
-    print(f"\n  {'N':>3} │ {'Proxy':^28} │ {'NS':^6} │ {'tun':^5}{'  WAN IP' if check_wan else ''}")
+    print(f"\n  {'N':>3} │ {'Proxy':^28} │ {'NS':^6} │ {'sb':^5}{'  WAN IP' if check_wan else ''}")
     print(f"  {'─'*3}─┼─{'─'*28}─┼─{'─'*6}─┼─{'─'*5}")
     up=down=disabled=0
     for n_str in sorted(modems,key=lambda x:int(x)):
         n=int(n_str); m=modems[n_str]; en=m.get("enabled",True); ps=f"{m['proxy_host']}:{m['proxy_port']}"
         if not en: disabled+=1; print(f"  {n:>3} │ {ps:<28} │ {D}{'—':^6}{R} │ {D}{'—':^5}{R}"); continue
         if n in active_ns:
-            up+=1; ns_m=f"{G}{'UP':^6}{R}"; t=is_process_running(f"tun2socks.*tun{n}"); tm=f"{G}{'✓':^5}{R}" if t else f"{RD}{'✗':^5}{R}"
+            up+=1; ns_m=f"{G}{'UP':^6}{R}"; t=is_process_running(f"sing-box.*modem_{n}\\.json"); tm=f"{G}{'✓':^5}{R}" if t else f"{RD}{'✗':^5}{R}"
             w=""
             if check_wan:
                 wr=run_safe(f"curl -s --max-time {CURL_TIMEOUT} --interface 192.168.{n}.100 2ip.ru", capture=True, quiet=True)
@@ -358,8 +399,8 @@ def cmd_check(target):
     (log_ok if r.returncode==0 and r.stdout.strip() else log_fail)(f"WAN IP (ns):    {r.stdout.strip() or 'недоступен'}")
     r=run_safe(f"curl -s --max-time 5 --interface 192.168.{n}.100 http://192.168.{n}.1/api/webserver/SesTokInfo", capture=True, quiet=True)
     (log_ok if "SesInfo" in r.stdout else log_fail)(f"Huawei API .1:  {'OK' if 'SesInfo' in r.stdout else 'недоступен'}")
-    t=is_process_running(f"tun2socks.*tun{n}")
-    (log_ok if t else log_fail)(f"tun2socks:      {'OK' if t else 'DEAD'}")
+    t=is_process_running(f"sing-box.*modem_{n}\\.json")
+    (log_ok if t else log_fail)(f"sing-box:       {'OK' if t else 'DEAD'}")
     log_step("Маршруты в ns:")
     for line in run_safe("ip route",ns=n,capture=True).stdout.strip().split("\n"): print(f"    {D}{line}{R}")
 
@@ -389,7 +430,7 @@ def cmd_restart(target):
         n=int(target); ns_down(n); time.sleep(1); ns_up(n, get_modem(config,n))
 
 def cmd_cleanup():
-    header("CLEANUP"); run_safe("pkill -f tun2socks", quiet=True); time.sleep(1)
+    header("CLEANUP"); run_safe("pkill -f 'sing-box run -c'", quiet=True); time.sleep(1)
     for n in get_active_ns_list(): ns_down(n, quiet=True)
     run_safe("iptables -t nat -F", quiet=True)
     import glob
@@ -398,6 +439,8 @@ def cmd_cleanup():
         if pp.is_dir():
             for f in pp.iterdir(): f.unlink()
             pp.rmdir()
+    if SINGBOX_CONF_DIR.exists():
+        for f in SINGBOX_CONF_DIR.glob("modem_*.json"): f.unlink()
     (CONFIG_DIR/"restart_counts.json").unlink(missing_ok=True); log_ok("Очистка завершена")
 
 def cmd_show_config():
@@ -475,8 +518,8 @@ def cmd_setup():
     link=Path("/usr/local/bin/proxyveth"); link.unlink(missing_ok=True); link.symlink_to(SCRIPT_PATH)
     log_ok("Symlink: proxyveth → proxyveth.py")
     active=len(get_active_ns_list()); enabled=len(get_enabled_modems(config))
-    wan_ip = run_safe(f"curl -s --max-time 5 2ip.ru", ns=n, capture=True).stdout.strip()
-    loc_ip=run_safe("hostname -I",capture=True).stdout.split()[0]
+    wan_ip=run_safe("curl -s --max-time 5 2ip.ru", capture=True).stdout.strip()
+    loc_ip=run_safe("hostname -I", capture=True).stdout.split()[0]
     print(f"""
 {G}{'═'*60}
   ProxyVeth УСТАНОВЛЕН: {active}/{enabled} NS активно
@@ -489,7 +532,7 @@ def cmd_setup():
     Root login     : root   |   OS: Unix
 """)
 
-USAGE=f"""{B}ProxyVeth v1.0{R}
+USAGE=f"""{B}ProxyVeth v2.0{R}
 Команды: sync / autosync / init / up [N|all] / down [N|all]
          restart [N|all] / status [--wan] / check N
          watchdog / watchdog-loop / cleanup / show-config"""
