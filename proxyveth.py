@@ -233,6 +233,7 @@ def _wait_tun_addr(n, timeout=SINGBOX_TIMEOUT):
 def ns_up(n, modem):
     ph=modem["proxy_host"]; pp=modem["proxy_port"]
     rt_table=RT_TABLE_BASE+n
+    veth_host=f"veth{n}h"; veth_ns=f"veth{n}n"
     print(f"\n  {B}── NS {n} ──{R}  {ph}:{pp}")
     if is_ns_exists(n): log_warn(f"ns_{n} уже существует — пропуск"); return True
     try:
@@ -242,12 +243,12 @@ def ns_up(n, modem):
         ns_dns=Path(f"/etc/netns/ns_{n}"); ns_dns.mkdir(parents=True, exist_ok=True)
         (ns_dns/"resolv.conf").write_text(f"nameserver {DNS_SERVER}\n")
         # 2. veth пара
-        run(f"ip link add veth_ext{n}_host type veth peer name veth_ext{n}_ns")
-        run(f"ip link set veth_ext{n}_ns netns ns_{n}")
-        run(f"ip addr add 192.168.{n}.100/24 dev veth_ext{n}_host")
-        run(f"ip link set veth_ext{n}_host up")
-        run(f"ip addr add 192.168.{n}.254/24 dev veth_ext{n}_ns", ns=n)
-        run(f"ip link set veth_ext{n}_ns up", ns=n)
+        run(f"ip link add {veth_host} type veth peer name {veth_ns}")
+        run(f"ip link set {veth_ns} netns ns_{n}")
+        run(f"ip addr add 192.168.{n}.100/24 dev {veth_host}")
+        run(f"ip link set {veth_host} up")
+        run(f"ip addr add 192.168.{n}.254/24 dev {veth_ns}", ns=n)
+        run(f"ip link set {veth_ns} up", ns=n)
         log_step(f"ns_{n}: veth OK")
         # 3. sing-box: пишем конфиг, запускаем внутри ns
         # credentials в файле — не торчат в ps aux, в отличие от tun2socks
@@ -270,15 +271,15 @@ def ns_up(n, modem):
         run(f"iptables -A FORWARD -o tun{n} -p udp -j DROP", ns=n)
         run("sysctl -w net.ipv4.ip_forward=1", ns=n)
         run(f"iptables -t nat -A POSTROUTING -o tun{n} -j MASQUERADE", ns=n)
-        run(f"iptables -A FORWARD -i veth_ext{n}_ns -o tun{n} -j ACCEPT", ns=n)
-        run(f"iptables -A FORWARD -i tun{n} -o veth_ext{n}_ns -j ACCEPT", ns=n)
+        run(f"iptables -A FORWARD -i {veth_ns} -o tun{n} -j ACCEPT", ns=n)
+        run(f"iptables -A FORWARD -i tun{n} -o {veth_ns} -j ACCEPT", ns=n)
         # 6. Хост: NAT + source routing
         r=run_safe(f"iptables -t nat -C POSTROUTING -s 192.168.{n}.0/24 -o {ETH_WAN} -j MASQUERADE", quiet=True)
         if r.returncode!=0: run(f"iptables -t nat -A POSTROUTING -s 192.168.{n}.0/24 -o {ETH_WAN} -j MASQUERADE")
         _ensure_rt_table(rt_table, f"modem_{n}")
         run_safe(f"ip rule del from 192.168.{n}.100 table {rt_table}", quiet=True)
         run(f"ip rule add from 192.168.{n}.100 table {rt_table}")
-        run(f"ip route add default via 192.168.{n}.254 dev veth_ext{n}_host table {rt_table}")
+        run(f"ip route add default via 192.168.{n}.254 dev {veth_host} table {rt_table}")
         log_ok(f"ns_{n} ГОТОВ | 192.168.{n}.100 → {ph}:{pp} | Huawei: 192.168.{n}.1")
         return True
     except Exception as e:
@@ -287,10 +288,11 @@ def ns_up(n, modem):
 def ns_down(n, quiet=False):
     if not quiet: print(f"  {D}↓ ns_{n}{R}", end="", flush=True)
     rt_table=RT_TABLE_BASE+n
+    veth_host=f"veth{n}h"
     run_safe(f"pkill -f 'sing-box run -c.*modem_{n}\\.json'", quiet=True)
     time.sleep(0.3)
     run_safe(f"ip netns del ns_{n}", quiet=True)
-    run_safe(f"ip link del veth_ext{n}_host", quiet=True)
+    run_safe(f"ip link del {veth_host}", quiet=True)
     run_safe(f"ip rule del from 192.168.{n}.100 table {rt_table}", quiet=True)
     run_safe(f"ip route flush table {rt_table}", quiet=True)
     run_safe(f"iptables -t nat -D POSTROUTING -s 192.168.{n}.0/24 -o {ETH_WAN} -j MASQUERADE", quiet=True)
