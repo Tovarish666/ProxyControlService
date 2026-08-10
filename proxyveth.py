@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ProxyVeth v3.0
+ProxyVeth v3.1
 SOCKS5 → network namespace → sing-box (tun) → veth → mp.space (source routing).
 
 Главное отличие от v2 — DNS.
@@ -32,6 +32,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -117,6 +118,7 @@ if not sys.stdout.isatty() or os.getenv("NO_COLOR"):
     R = G = RD = Y = C = B = D = ""
 
 _HOST_LOCK = threading.Lock()   # хостовые iptables/ip rule из нескольких потоков
+_PRINT_LOCK = threading.Lock()  # чтобы 8 потоков не месили вывод построчно
 _WAN_IFACE = None
 
 
@@ -178,30 +180,47 @@ def shq(args, ns=None, timeout=60):
     return sh(args, ns=ns, check=False, timeout=timeout, quiet=True)
 
 
-def ipt(args, ns=None, check=True):
-    """iptables с -w: без него параллельные вызовы дерутся за xtables lock."""
-    return sh(["iptables", "-w", "5"] + list(args), ns=ns, check=check, quiet=not check)
+def ipt(args, ns=None, table=None, check=True, quiet=None):
+    """iptables.
+
+    ВАЖНО: -t <таблица> обязан идти ДО команды (-A/-I/-D/-C), иначе iptables
+    ругается «Bad argument». Поэтому таблица — отдельный параметр, а не часть
+    правила: собрать её в неправильном порядке физически нельзя.
+    -w нужен, чтобы параллельные вызовы не дрались за xtables lock.
+    """
+    cmd = ["iptables", "-w", "5"]
+    if table:
+        cmd += ["-t", table]
+    cmd += list(args)
+    if quiet is None:
+        quiet = not check
+    return sh(cmd, ns=ns, check=check, quiet=quiet)
 
 
-def ipt_has(args, ns=None):
-    return ipt(["-C"] + list(args), ns=ns, check=False).returncode == 0
+def ipt_has(rule, ns=None, table=None):
+    return ipt(["-C"] + list(rule), ns=ns, table=table, check=False).returncode == 0
 
 
-def ipt_add(args, ns=None):
-    if not ipt_has(args, ns=ns):
-        ipt(["-A"] + list(args), ns=ns)
+def ipt_add(rule, ns=None, table=None, check=True):
+    if ipt_has(rule, ns=ns, table=table):
+        return True
+    return ipt(["-A"] + list(rule), ns=ns, table=table, check=check).returncode == 0
 
 
-def ipt_ins(args, ns=None):
+def ipt_ins(rule, ns=None, table=None, check=True):
     """Вставить первой — важно для ACCEPT'ов, которые должны быть выше DROP."""
-    if not ipt_has(args, ns=ns):
-        ipt(["-I"] + list(args), ns=ns)
+    if ipt_has(rule, ns=ns, table=table):
+        return True
+    return ipt(["-I"] + list(rule), ns=ns, table=table, check=check).returncode == 0
 
 
-def ipt_del(args, ns=None):
-    while ipt_has(args, ns=ns):
-        if ipt(["-D"] + list(args), ns=ns, check=False).returncode != 0:
+def ipt_del(rule, ns=None, table=None):
+    n = 0
+    while n < 20 and ipt_has(rule, ns=ns, table=table):
+        if ipt(["-D"] + list(rule), ns=ns, table=table, check=False).returncode != 0:
             break
+        n += 1
+    return n
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -726,17 +745,18 @@ def ns_up(n, modem, verbose=True):
         # Остальной UDP режем: mproxy иначе заливает 3proxy тысячами пакетов/сек.
         for chain in ("OUTPUT", "FORWARD"):
             ipt_add([chain, "-o", f"tun{n}", "-p", "udp", "-j", "DROP"], ns=n)
-        ipt_add(["-t", "nat", "POSTROUTING", "-o", f"tun{n}", "-j", "MASQUERADE"], ns=n)
+        ipt_add(["POSTROUTING", "-o", f"tun{n}", "-j", "MASQUERADE"], ns=n, table="nat")
         ipt_add(["FORWARD", "-i", vn, "-o", f"tun{n}", "-j", "ACCEPT"], ns=n)
         ipt_add(["FORWARD", "-i", f"tun{n}", "-o", vn, "-j", "ACCEPT"], ns=n)
-        # MSS clamp: через SOCKS5+tun крупные пакеты иначе теряются молча
+        # MSS clamp: через SOCKS5+tun крупные пакеты иначе теряются молча.
+        # Не критично — если модуля TCPMSS нет, работаем без него.
         ipt_add(["FORWARD", "-o", f"tun{n}", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-                 "-j", "TCPMSS", "--clamp-mss-to-pmtu"], ns=n)
+                 "-j", "TCPMSS", "--clamp-mss-to-pmtu"], ns=n, check=False)
 
         # 6. Хост: NAT для bypass-трафика + source routing
         with _HOST_LOCK:
-            ipt_add(["-t", "nat", "POSTROUTING", "-s", f"192.168.{n}.0/24",
-                     "-o", wan, "-j", "MASQUERADE"])
+            ipt_add(["POSTROUTING", "-s", f"192.168.{n}.0/24",
+                     "-o", wan, "-j", "MASQUERADE"], table="nat")
             shq(["ip", "rule", "del", "from", f"192.168.{n}.100", "table", str(rt)])
             sh(["ip", "rule", "add", "from", f"192.168.{n}.100", "table", str(rt)])
             shq(["ip", "route", "flush", "table", str(rt)])
@@ -770,8 +790,8 @@ def ns_down(n, quiet=False):
                    "table", str(rt)]).returncode == 0:
             pass
         shq(["ip", "route", "flush", "table", str(rt)])
-        ipt_del(["-t", "nat", "POSTROUTING", "-s", f"192.168.{n}.0/24",
-                 "-o", wan, "-j", "MASQUERADE"])
+        ipt_del(["POSTROUTING", "-s", f"192.168.{n}.0/24",
+                 "-o", wan, "-j", "MASQUERADE"], table="nat")
     ns_etc = Path(f"/etc/netns/ns_{n}")
     if ns_etc.is_dir():
         shutil.rmtree(ns_etc, ignore_errors=True)
@@ -826,6 +846,23 @@ def _parallel(items, fn):
         return list(ex.map(fn, items))
 
 
+def _up_many(modems):
+    """Параллельный подъём с построчным прогрессом вместо каши из 8 потоков."""
+    total = len(modems)
+    done = [0]
+
+    def worker(pair):
+        n, m = pair
+        res = ns_up(n, m, verbose=False)
+        with _PRINT_LOCK:
+            done[0] += 1
+            mark = f"{G}✓{R}" if res else f"{RD}✗{R}"
+            print(f"  {mark} [{done[0]:>3}/{total}] ns_{n}")
+        return res
+
+    return _parallel(modems, worker)
+
+
 def cmd_up(target):
     config = load_config()
     cmd_init(quiet=True)
@@ -835,9 +872,11 @@ def cmd_up(target):
             modems = enabled_modems(config)
             log_info(f"Модемов: {len(modems)}, потоков: {min(WORKERS, max(1, len(modems)))}")
             t0 = time.time()
-            res = _parallel(modems, lambda pair: ns_up(pair[0], pair[1]))
+            res = _up_many(modems)
             ok = sum(1 for x in res if x)
             header(f"РЕЗУЛЬТАТ: {ok} ✓ поднято, {len(res) - ok} ✗ ошибок ({time.time() - t0:.0f}с)")
+            if ok < len(res):
+                log_info("Разбор по одному:  proxyveth check N   |   proxyveth problems")
             return 0 if ok == len(res) else 1
         n = int(target)
         return 0 if ns_up(n, get_modem(config, n)) else 1
@@ -866,8 +905,7 @@ def cmd_restart(target):
             ns_list = active_ns_list()
             _parallel(ns_list, lambda n: ns_down(n, quiet=True))
             time.sleep(1)
-            modems = enabled_modems(config)
-            res = _parallel(modems, lambda pair: ns_up(pair[0], pair[1]))
+            res = _up_many(enabled_modems(config))
             ok = sum(1 for x in res if x)
             header(f"РЕЗУЛЬТАТ: {ok}/{len(res)}")
             return 0 if ok == len(res) else 1
@@ -1002,9 +1040,11 @@ def cmd_check(n):
     r = shq(["ip", "route", "show", "table", str(rt)])
     chk(f"таблица {rt}", "default" in r.stdout)
     chk("MASQUERADE на хосте",
-        ipt_has(["-t", "nat", "POSTROUTING", "-s", f"192.168.{n}.0/24",
-                 "-o", wan_iface(), "-j", "MASQUERADE"]),
+        ipt_has(["POSTROUTING", "-s", f"192.168.{n}.0/24",
+                 "-o", wan_iface(), "-j", "MASQUERADE"], table="nat"),
         f"({wan_iface()})")
+    chk("MASQUERADE внутри ns",
+        ipt_has(["POSTROUTING", "-o", f"tun{n}", "-j", "MASQUERADE"], ns=n, table="nat"))
 
     log_step("DNS внутри namespace...")
     chk("резолв через туннель", ns_dns_ok(n))
@@ -1272,15 +1312,21 @@ def cmd_cleanup():
         for n in active_ns_list():
             ns_down(n, quiet=True)
         # Раньше здесь был iptables -t nat -F — он сносил и правила mp.space.
-        wan = wan_iface()
+        # Удаляем ровно те строки, что показал -S, а не «похожие»: интерфейс
+        # в старом правиле мог быть другим (переименовали, сменили WAN).
         r = shq(["iptables", "-w", "5", "-t", "nat", "-S", "POSTROUTING"])
         removed = 0
         for line in r.stdout.splitlines():
-            m = re.search(r"-s (192\.168\.(\d+)\.0/24) .*-j MASQUERADE", line)
-            if not m:
+            if not line.startswith("-A POSTROUTING") or "MASQUERADE" not in line:
                 continue
-            ipt_del(["-t", "nat", "POSTROUTING", "-s", m.group(1), "-o", wan, "-j", "MASQUERADE"])
-            removed += 1
+            if not re.search(r"-s 192\.168\.\d+\.0/24\b", line):
+                continue
+            try:
+                spec = shlex.split(line)[1:]      # выкидываем -A
+            except ValueError:
+                continue
+            if ipt(["-D"] + spec, table="nat", check=False).returncode == 0:
+                removed += 1
         for path in glob.glob("/etc/netns/ns_*"):
             shutil.rmtree(path, ignore_errors=True)
         for f in SINGBOX_CONF_DIR.glob("modem_*.json"):
@@ -1309,6 +1355,11 @@ def cmd_doctor():
         if Path(SINGBOX_BIN).exists() else "не установлен")
     r = shq(["sysctl", "-n", "net.ipv4.ip_forward"])
     chk("ip_forward", r.stdout.strip() == "1")
+    chk("iptables, таблица nat", shq(["iptables", "-w", "5", "-t", "nat", "-S"]).returncode == 0)
+    chk("модуль TCPMSS",
+        ipt(["-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+             "-j", "TCPMSS", "--clamp-mss-to-pmtu"], check=False).returncode in (0, 1),
+        "(необязателен)")
     chk("WAN-интерфейс определён", wan_iface() != "eth0" or
         shq(["ip", "link", "show", "eth0"]).returncode == 0, f"({wan_iface()})")
 
@@ -1361,7 +1412,9 @@ Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=-{env}
 ExecStart={py} {script} init
-ExecStart={py} {script} up all
+# «-» намеренно: при 80 модемах один недоступный не должен помечать юнит
+# как failed — иначе watchdog, который и должен его чинить, не стартует вовсе.
+ExecStart=-{py} {script} up all
 ExecStop={py} {script} down all
 TimeoutStartSec=900
 TimeoutStopSec=300
@@ -1372,7 +1425,7 @@ WantedBy=multi-user.target
     "proxyveth-watchdog.service": """[Unit]
 Description=ProxyVeth Watchdog
 After=proxyveth.service
-Requires=proxyveth.service
+Wants=proxyveth.service
 
 [Service]
 Type=simple
@@ -1454,7 +1507,7 @@ def cmd_show_config():
 # ════════════════════════════════════════════════════════════════════════════
 #  main
 # ════════════════════════════════════════════════════════════════════════════
-USAGE = f"""{B}ProxyVeth v3.0{R}
+USAGE = f"""{B}ProxyVeth v3.1{R}
 
   proxyveth sync                 обновить config.json из источника
   proxyveth autosync             sync + применить разницу (add/remove/restart)
