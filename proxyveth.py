@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ProxyVeth v3.1
+ProxyVeth v3.2
 SOCKS5 → network namespace → sing-box (tun) → veth → mp.space (source routing).
 
 Главное отличие от v2 — DNS.
@@ -22,6 +22,15 @@ SOCKS5 → network namespace → sing-box (tun) → veth → mp.space (source ro
   • up/down all — параллельно (200 модемов больше не упираются в TimeoutStartSec).
   • config.json и конфиги sing-box — 0600, каталоги 0700.
   • cleanup удаляет только свои правила (раньше делал iptables -t nat -F).
+
+v3.2:
+  • Имена интерфейсов: на хосте ethN (VETH_PREFIX), внутри namespace — eth0.
+    Было veth_ext{N}_host — 16 символов при трёхзначном N, то есть длиннее
+    лимита IFNAMSIZ, и модемы с N ≥ 100 не создавались в принципе.
+  • Проверка пересечения 192.168.N.0/24 с сетью самой ВМ. Без неё модем N=1
+    на ВМ в 192.168.1.0/24 добавляет вторую connected-маршрутку на тот же
+    префикс — и ВМ теряет связь с собственной LAN, включая SSH.
+  • proxyveth rescue — снять всё и отключить автозапуск одной командой.
 """
 
 import csv
@@ -97,6 +106,12 @@ SINGBOX_URL = (f"https://github.com/SagerNet/sing-box/releases/download/"
 # Резолвер для namespace. Ходит ЧЕРЕЗ туннель, отвечает sing-box (TCP к нему же).
 NS_DNS = os.getenv("NS_DNS", "1.1.1.1")
 NS_DNS_ALT = os.getenv("NS_DNS_ALT", "8.8.8.8")
+# Имена интерфейсов. На хосте — {VETH_PREFIX}{N} (eth41), внутри namespace —
+# всегда eth0: там своё пространство имён, и это самое читаемое имя.
+# Если добавишь ВМ второй физический адаптер, ядро тоже захочет имя ethN —
+# тогда поставь VETH_PREFIX=mdm в /etc/proxyveth/env.
+VETH_PREFIX = os.getenv("VETH_PREFIX", "eth")
+NS_IFACE = os.getenv("NS_IFACE", "eth0")
 RT_TABLE_BASE = int(os.getenv("RT_TABLE_BASE", "100"))
 TUN_TIMEOUT = int(os.getenv("TUN_TIMEOUT", "15"))
 CURL_TIMEOUT = int(os.getenv("CURL_TIMEOUT", "10"))
@@ -330,6 +345,66 @@ def active_ns_list():
     return sorted(out)
 
 
+def host_veth_names():
+    """Наши veth-концы на хосте — по ТИПУ устройства, а не по имени.
+    Иначе при VETH_PREFIX=eth проверки спутали бы настоящий eth0 с нашим eth5."""
+    out = set()
+    r = shq(["ip", "-o", "link", "show", "type", "veth"])
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 2:
+            out.add(f[1].rstrip(":").split("@")[0])
+    return out
+
+
+_HOST_NETS = None
+_HOST_NETS_LOCK = threading.Lock()
+
+
+def host_ipv4_nets(refresh=False):
+    """Сети, реально настроенные на ВМ (без наших veth и tun)."""
+    global _HOST_NETS
+    with _HOST_NETS_LOCK:
+        if _HOST_NETS is not None and not refresh:
+            return _HOST_NETS
+        veths = host_veth_names()
+        nets = []
+        r = shq(["ip", "-4", "-o", "addr", "show"])
+        for line in r.stdout.splitlines():
+            f = line.split()
+            if len(f) < 4 or f[2] != "inet":
+                continue
+            iface = f[1]
+            if iface == "lo" or iface in veths or iface.startswith("tun"):
+                continue
+            try:
+                nets.append((iface, ipaddress.ip_network(f[3], strict=False)))
+            except ValueError:
+                continue
+        _HOST_NETS = nets
+        return _HOST_NETS
+
+
+def ns_conflict(n):
+    """Схема ProxyVeth занимает 192.168.N.0/24 на самом хосте. Если ВМ живёт
+    в той же сети — появляется вторая connected-маршрутка на тот же префикс,
+    и ВМ теряет связь с собственной LAN (в т.ч. SSH). Ловим ДО создания."""
+    net = ipaddress.ip_network(f"192.168.{n}.0/24")
+    for iface, hn in host_ipv4_nets():
+        if net.overlaps(hn):
+            return f"{hn} на {iface}"
+    return None
+
+
+def config_conflicts(config):
+    out = []
+    for n, _m in enabled_modems(config):
+        c = ns_conflict(n)
+        if c:
+            out.append((n, c))
+    return out
+
+
 def resolve_host(host):
     """SOCKS5-хост обязан быть IP: на него ставится /32-маршрут в обход туннеля.
     Если в таблице имя — резолвим один раз здесь, на хосте."""
@@ -515,6 +590,11 @@ def do_sync(quiet=False):
     save_config(config)
     if not quiet:
         log_ok(f"Сохранено: {sum(1 for m in modems.values() if m.get('enabled', True))} активных")
+    # Конфликт сетей показываем всегда, даже в quiet: он стоит потери связи с ВМ
+    for n, c in config_conflicts(config):
+        log_fail(f"КОНФЛИКТ СЕТЕЙ: модем N={n} → 192.168.{n}.0/24 пересекается с {c}")
+        log_warn(f"  ns_{n} подниматься не будет. Варианты: увести ВМ в другую подсеть, "
+                 f"выключить модем (enabled=0) или перенумеровать его.")
     return config
 
 
@@ -664,7 +744,13 @@ def wait_tun(n, pid, timeout=TUN_TIMEOUT):
 #  Namespace up/down
 # ════════════════════════════════════════════════════════════════════════════
 def veth_names(n):
-    return f"veth{n}h", f"veth{n}n"
+    """(имя на хосте, имя внутри namespace)."""
+    return f"{VETH_PREFIX}{n}", NS_IFACE
+
+
+def legacy_host_ifaces(n):
+    """Имена из прежних версий — чтобы down/cleanup подобрали хвосты."""
+    return [f"veth{n}h", f"veth{n}n", f"veth_ext{n}_host", f"pvtmp{n}"]
 
 
 def _sysctl(key, value, ns=None):
@@ -680,6 +766,12 @@ def ns_up(n, modem, verbose=True):
 
     if verbose:
         print(f"\n  {B}── NS {n} ──{R}  {modem['proxy_host']}:{pp}")
+
+    conflict = ns_conflict(n)
+    if conflict:
+        log_fail(f"ns_{n}: сеть модема 192.168.{n}.0/24 пересекается с сетью ВМ "
+                 f"({conflict}). Подъём отменён — иначе ВМ потеряет связь.")
+        return False
 
     if is_ns_exists(n):
         # v2 здесь возвращал успех не глядя — сломанный NS числился поднятым.
@@ -705,9 +797,16 @@ def ns_up(n, modem, verbose=True):
             f"nameserver {NS_DNS_ALT}\n"
             f"options timeout:3 attempts:2 single-request\n")
 
-        # 2. veth-пара
-        sh(["ip", "link", "add", vh, "type", "veth", "peer", "name", vn])
-        sh(["ip", "link", "set", vn, "netns", f"ns_{n}"])
+        # 2. veth-пара. Хост: ethN. Внутри ns: eth0.
+        #    Peer рождается под временным именем и переименовывается уже внутри
+        #    namespace: в момент создания оба конца лежат в корневом namespace
+        #    и не могут называться одинаково. Переименование возможно только
+        #    пока интерфейс down — поэтому до `ip link set ... up`.
+        vtmp = f"pvtmp{n}"
+        shq(["ip", "link", "del", vtmp])          # хвост от прошлого падения
+        sh(["ip", "link", "add", vh, "type", "veth", "peer", "name", vtmp])
+        sh(["ip", "link", "set", vtmp, "netns", f"ns_{n}"])
+        sh(["ip", "link", "set", vtmp, "name", vn], ns=n)
         sh(["ip", "addr", "add", f"192.168.{n}.100/24", "dev", vh])
         sh(["ip", "link", "set", vh, "up"])
         sh(["ip", "addr", "add", f"192.168.{n}.254/24", "dev", vn], ns=n)
@@ -785,6 +884,9 @@ def ns_down(n, quiet=False):
     singbox_stop(n)
     shq(["ip", "netns", "del", f"ns_{n}"])
     shq(["ip", "link", "del", vh])
+    for old in legacy_host_ifaces(n):     # хвосты прежних схем именования
+        if old != vh:
+            shq(["ip", "link", "del", old])
     with _HOST_LOCK:
         while shq(["ip", "rule", "del", "from", f"192.168.{n}.100",
                    "table", str(rt)]).returncode == 0:
@@ -866,6 +968,7 @@ def _up_many(modems):
 def cmd_up(target):
     config = load_config()
     cmd_init(quiet=True)
+    host_ipv4_nets(refresh=True)
     with Lock():
         if target == "all":
             header("UP ALL")
@@ -1022,6 +1125,12 @@ def cmd_check(n):
             bad += 1
         return cond
 
+    log_info(f"Интерфейсы: хост {vh}  ↔  внутри ns {vn}")
+    conflict = ns_conflict(n)
+    if conflict:
+        log_fail(f"сеть 192.168.{n}.0/24 пересекается с сетью ВМ ({conflict}) — "
+                 f"этот модем принципиально не поднимется на этой ВМ")
+        return 1
     if not chk("namespace ns_%d" % n, is_ns_exists(n)):
         log_info(f"Поднять: proxyveth up {n}")
         return 1
@@ -1092,6 +1201,7 @@ def watchdog_pass(pass_number):
     # в v2 watchdog поднимал модемы со старыми учётками.
     config = load_config(required=False)
     modems = enabled_modems(config)
+    host_ipv4_nets(refresh=True)   # сеть ВМ могла смениться между проходами
     check_wan = WATCHDOG_WAN_EVERY > 0 and pass_number % WATCHDOG_WAN_EVERY == 0
 
     rc_file = CONFIG_DIR / "restart_counts.json"
@@ -1219,7 +1329,7 @@ def cmd_autosync():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  install / init / cleanup / doctor
+#  install / init / cleanup / rescue / doctor
 # ════════════════════════════════════════════════════════════════════════════
 def _apt(args):
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
@@ -1327,6 +1437,13 @@ def cmd_cleanup():
                 continue
             if ipt(["-D"] + spec, table="nat", check=False).returncode == 0:
                 removed += 1
+        # Осиротевшие veth (в т.ч. под именами прежних версий). Ищем по типу
+        # устройства, поэтому настоящий eth0 сюда не попадёт при VETH_PREFIX=eth.
+        pat = re.compile(rf"^(?:{re.escape(VETH_PREFIX)}|pvtmp)\d+$"
+                         rf"|^veth\d+[hn]$|^veth_ext\d+_host$")
+        for name in host_veth_names():
+            if pat.match(name):
+                shq(["ip", "link", "del", name])
         for path in glob.glob("/etc/netns/ns_*"):
             shutil.rmtree(path, ignore_errors=True)
         for f in SINGBOX_CONF_DIR.glob("modem_*.json"):
@@ -1335,6 +1452,20 @@ def cmd_cleanup():
             f.unlink(missing_ok=True)
         (CONFIG_DIR / "restart_counts.json").unlink(missing_ok=True)
     log_ok(f"Очистка завершена (снято правил NAT: {removed})")
+    return 0
+
+
+def cmd_rescue():
+    """Аварийный выход: снять всё своё и отключить автозапуск.
+    Ровно для случая «ВМ потеряла сеть, зашёл через qm guest exec»."""
+    header("RESCUE")
+    log_warn("Снимаю все namespace и отключаю автозапуск proxyveth")
+    for unit in ("proxyveth-watchdog.service", "proxyveth-autosync.timer",
+                 "proxyveth-autosync.service", "proxyveth.service"):
+        shq(["systemctl", "disable", "--now", unit], timeout=120)
+    cmd_cleanup()
+    log_ok("Готово — сеть ВМ должна вернуться в исходное состояние")
+    log_info("Включить обратно:  proxyveth systemd && proxyveth up all")
     return 0
 
 
@@ -1375,10 +1506,17 @@ def cmd_doctor():
             ok_names += 1
     chk("хост резолвит имена", ok_names == 2, f"{ok_names}/2")
 
+    log_info(f"Имена интерфейсов: хост {VETH_PREFIX}N, внутри namespace {NS_IFACE}")
+    nets = ", ".join(f"{i}:{s}" for i, s in host_ipv4_nets(refresh=True)) or "нет"
+    log_info(f"Сети самой ВМ: {nets}")
+
     chk("конфиг существует", CONFIG_FILE.exists(), str(CONFIG_FILE))
     if CONFIG_FILE.exists():
         mode = oct(CONFIG_FILE.stat().st_mode & 0o777)
         chk("права на конфиг", CONFIG_FILE.stat().st_mode & 0o077 == 0, mode)
+        confl = config_conflicts(load_config(required=False))
+        chk("сети модемов не пересекаются с сетью ВМ", not confl,
+            ("конфликтуют N=" + ",".join(str(n) for n, _ in confl)) if confl else "")
     chk("источник задан", bool(SOURCE_URL or SHEET_ID),
         (SOURCE_URL[:50] + "...") if SOURCE_URL else "")
 
@@ -1507,7 +1645,7 @@ def cmd_show_config():
 # ════════════════════════════════════════════════════════════════════════════
 #  main
 # ════════════════════════════════════════════════════════════════════════════
-USAGE = f"""{B}ProxyVeth v3.1{R}
+USAGE = f"""{B}ProxyVeth v3.2{R}
 
   proxyveth sync                 обновить config.json из источника
   proxyveth autosync             sync + применить разницу (add/remove/restart)
@@ -1526,8 +1664,10 @@ USAGE = f"""{B}ProxyVeth v3.1{R}
   proxyveth setup                install + sync + up all + systemd
   proxyveth show-config
   proxyveth cleanup              снять всё своё (namespace, правила, конфиги)
+  proxyveth rescue               cleanup + отключить автозапуск (ВМ без сети)
 
-  Источник: API_URL | SHEET_CSV_URL | SHEET_ID  (файл {ENV_FILE})
+  Источник:  API_URL | SHEET_CSV_URL | SHEET_ID   (файл {ENV_FILE})
+  Интерфейсы: {VETH_PREFIX}N на хосте, {NS_IFACE} внутри namespace (VETH_PREFIX=)
 """
 
 
@@ -1560,6 +1700,8 @@ def main():
             rc = cmd_systemd()
         elif cmd == "cleanup":
             rc = cmd_cleanup()
+        elif cmd == "rescue":
+            rc = cmd_rescue()
         elif cmd == "doctor":
             rc = cmd_doctor()
         elif cmd == "problems":
