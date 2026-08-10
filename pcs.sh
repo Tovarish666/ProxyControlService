@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-#  pcs — Proxy Control Service  v2.0
+#  pcs — Proxy Control Service  v2.1
 #  https://github.com/Tovarish666/ProxyControlService
 #
 #  Запуск: bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main/pcs.sh)
@@ -8,7 +8,10 @@
 #  Что изменилось против v1.1:
 #   • IP ВМ больше не выковыривается из qm terminal через expect. По умолчанию
 #     статика через cloud-init, при DHCP — QEMU guest agent. expect выброшен.
-#   • SSH на логин/пароль (sshpass). Пароль включается ДО первого коннекта,
+#   • SSH на логин/пароль через штатный SSH_ASKPASS_REQUIRE=force (OpenSSH ≥8.4,
+#     то есть Proxmox 7 и 8) — никаких sshpass и лишних пакетов на хосте.
+#     sshpass используется только как запасной путь на древних хостах.
+#     Парольный вход включается ДО первого коннекта,
 #     файлом /etc/ssh/sshd_config.d/10-pcs.conf — sshd берёт первое значение,
 #     а cloudimg кладёт «PasswordAuthentication no» в 60-…, так что 99-… не работал.
 #   • DNS: никакого «rm resolv.conf + chattr +i». Штатный systemd-resolved,
@@ -23,7 +26,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="2.0"
+VERSION="2.1"
 GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main"
 PROXYVETH_URL="${GITHUB_RAW}/proxyveth.py"
 SELF_URL="${GITHUB_RAW}/pcs.sh"
@@ -239,7 +242,45 @@ select_vm() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SSH — логин/пароль, без ключей
+#
+#  Пароль отдаём через SSH_ASKPASS_REQUIRE=force — это штатный механизм
+#  OpenSSH ≥ 8.4 (Proxmox 7 = 8.4, Proxmox 8 = 9.2), никаких лишних пакетов.
+#  sshpass остаётся как запасной путь для совсем древних хостов.
 # ═══════════════════════════════════════════════════════════════════════════
+SSH_METHOD=""; SSH_VER=""; PCS_ASKPASS=""
+
+ssh_setup() {
+    PCS_ASKPASS="${PCS_TMP}/askpass"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$PCS_SSH_PASS"\n' > "$PCS_ASKPASS"
+    chmod 700 "$PCS_ASKPASS"
+    local major minor
+    SSH_VER=$(ssh -V 2>&1 | sed -n 's/^OpenSSH_\([0-9]\+\.[0-9]\+\).*/\1/p')
+    major="${SSH_VER%%.*}"; minor="${SSH_VER##*.}"
+    [[ "$major" =~ ^[0-9]+$ ]] || major=0
+    [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+    if (( major > 8 || (major == 8 && minor >= 4) )); then
+        SSH_METHOD="askpass"
+    elif command -v sshpass >/dev/null 2>&1; then
+        SSH_METHOD="sshpass"
+    else
+        SSH_METHOD="none"
+    fi
+}
+
+ssh_run() {                       # ssh_run <ssh|scp> аргументы...
+    local bin="$1"; shift
+    case "$SSH_METHOD" in
+        askpass)
+            PCS_SSH_PASS="${VM_PASSWORD:-}" SSH_ASKPASS="$PCS_ASKPASS" \
+            SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-:0}" \
+                "$bin" "$@" ;;
+        sshpass)
+            SSHPASS="${VM_PASSWORD:-}" sshpass -e "$bin" "$@" ;;
+        *)
+            "$bin" "$@" ;;
+    esac
+}
+
 # UserKnownHostsFile=/dev/null обязателен: пересозданная ВМ получает тот же IP
 # с новым host key, и StrictHostKeyChecking=no от этого НЕ спасает.
 SSH_OPTS=(
@@ -256,28 +297,23 @@ SSH_OPTS=(
 )
 
 vm_ssh() {                        # vm_ssh "команда..."
-    SSHPASS="${VM_PASSWORD:-}" sshpass -e ssh "${SSH_OPTS[@]}" \
-        -p "${VM_SSH_PORT:-22}" "root@${VM_IP}" "$@"
+    ssh_run ssh "${SSH_OPTS[@]}" -p "${VM_SSH_PORT:-22}" "root@${VM_IP}" "$@"
 }
 vm_sh() {                         # vm_sh "многострочный скрипт"
-    SSHPASS="${VM_PASSWORD:-}" sshpass -e ssh "${SSH_OPTS[@]}" \
-        -p "${VM_SSH_PORT:-22}" "root@${VM_IP}" "bash -s" <<<"$1"
+    ssh_run ssh "${SSH_OPTS[@]}" -p "${VM_SSH_PORT:-22}" "root@${VM_IP}" "bash -s" <<<"$1"
 }
 vm_scp() {                        # vm_scp локальный удалённый
-    SSHPASS="${VM_PASSWORD:-}" sshpass -e scp "${SSH_OPTS[@]}" \
-        -P "${VM_SSH_PORT:-22}" "$1" "root@${VM_IP}:$2"
+    ssh_run scp "${SSH_OPTS[@]}" -P "${VM_SSH_PORT:-22}" "$1" "root@${VM_IP}:$2"
 }
 vm_alive() { [[ -n "${VM_IP:-}" ]] && vm_ssh true 2>/dev/null; }
 vm_running() { [[ -n "${VM_ID:-}" ]] && qm status "$VM_ID" 2>/dev/null | grep -q running; }
 
 wait_ssh() {                      # wait_ssh <ip> [сек]
     local ip="$1" limit="${2:-420}" elapsed=0
+    VM_IP="$ip"
     spinner_start "Ждём SSH на ${ip} (пароль)... 0с"
     while (( elapsed < limit )); do
-        if SSHPASS="${VM_PASSWORD:-}" sshpass -e ssh "${SSH_OPTS[@]}" \
-             -p "${VM_SSH_PORT:-22}" "root@${ip}" true 2>/dev/null; then
-            spinner_stop; return 0
-        fi
+        if vm_ssh true 2>/dev/null; then spinner_stop; return 0; fi
         sleep 5; elapsed=$((elapsed+5))
         spinner_stop; spinner_start "Ждём SSH на ${ip} (пароль)... ${elapsed}с"
     done
@@ -455,18 +491,49 @@ host_net_defaults() {
     : "${DEF_GW:=}" "${DEF_DEV:=}" "${DEF_SRC:=}" "${DEF_MASK:=24}"
 }
 
-ensure_host_deps() {
-    local missing=()
-    command -v sshpass >/dev/null || missing+=(sshpass)
-    command -v wget    >/dev/null || missing+=(wget)
-    command -v base64  >/dev/null || missing+=(coreutils)
-    if (( ${#missing[@]} )); then
-        step "Ставим на хост: ${missing[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq >>"$PCS_LOG" 2>&1
-        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq "${missing[@]}" >>"$PCS_LOG" 2>&1 \
-            || die "не удалось поставить ${missing[*]} — проверь репозитории и DNS на хосте"
+host_apt_install() {              # host_apt_install пакет...
+    local out rc
+    out=$(DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq 2>&1); rc=$?
+    printf '%s\n' "$out" >>"$PCS_LOG"
+    if (( rc != 0 )); then
+        warn "apt-get update вернул ошибку:"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
+        if grep -q 'enterprise\.proxmox\.com' <<<"$out"; then
+            info "Это платный репозиторий pve-enterprise: без подписки он всегда отдаёт 401."
+            info "Лечится отключением /etc/apt/sources.list.d/pve-enterprise.* и включением pve-no-subscription."
+        fi
     fi
-    command -v sshpass >/dev/null || die "sshpass не установлен, а без него нет парольного SSH"
+    out=$(DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq "$@" 2>&1); rc=$?
+    printf '%s\n' "$out" >>"$PCS_LOG"
+    if (( rc != 0 )); then
+        warn "apt-get install $* не прошёл:"
+        printf '%s\n' "$out" | tail -8 | sed 's/^/      /'
+    fi
+    return $rc
+}
+
+ensure_host_deps() {
+    local rc=0
+    command -v wget   >/dev/null 2>&1 || { bad "на хосте нет wget"; rc=1; }
+    command -v base64 >/dev/null 2>&1 || { bad "на хосте нет base64 (coreutils)"; rc=1; }
+    ssh_setup
+    case "$SSH_METHOD" in
+        askpass)
+            ok "Парольный SSH: SSH_ASKPASS, OpenSSH ${SSH_VER} — сторонних пакетов не нужно" ;;
+        sshpass)
+            ok "Парольный SSH: sshpass (OpenSSH ${SSH_VER:-?} старее 8.4)" ;;
+        none)
+            warn "OpenSSH ${SSH_VER:-?} старее 8.4 и sshpass не установлен"
+            step "Пробуем поставить sshpass..."
+            if host_apt_install sshpass; then
+                SSH_METHOD="sshpass"; ok "sshpass установлен"
+            else
+                bad "Парольный SSH недоступен"
+                info "Поставь вручную:  apt-get install -y sshpass"
+                rc=1
+            fi ;;
+    esac
+    return $rc
 }
 
 ensure_ubuntu_image() {
@@ -713,7 +780,7 @@ done
 
 do_install_vm() {
     hdr "Установка ВМ"
-    ensure_host_deps
+    ensure_host_deps || return 1
     host_net_defaults
 
     local newid=""
@@ -834,7 +901,7 @@ st_proxyveth() {
 do_install_proxyveth() {
     hdr "Установка ProxyVeth"
     need_vm || return 1
-    ensure_host_deps
+    ensure_host_deps || return 1
     vm_alive || { bad "ВМ недоступна по SSH (${VM_IP})"; return 1; }
     prompt "URL таблицы/API с прокси (Enter — позже)" "" SHEET_CSV_URL
     run_step "ProxyVeth" st_proxyveth || return 1
@@ -1059,8 +1126,13 @@ do_doctor() {
     printf '\n  %sХост Proxmox%s\n' "$B" "$R"
     command -v qm      >/dev/null; chk $? "qm"
     command -v pvesm   >/dev/null; chk $? "pvesm"
-    command -v sshpass >/dev/null; chk $? "sshpass (парольный SSH)"
     command -v wget    >/dev/null; chk $? "wget"
+    ssh_setup
+    case "$SSH_METHOD" in
+        askpass) ok "парольный SSH: SSH_ASKPASS (OpenSSH ${SSH_VER})" ;;
+        sshpass) ok "парольный SSH: sshpass (OpenSSH ${SSH_VER:-?})" ;;
+        *)       bad "парольный SSH недоступен (OpenSSH ${SSH_VER:-?} < 8.4 и нет sshpass)"; bad_n=$((bad_n+1)) ;;
+    esac
     getent ahostsv4 cloud-images.ubuntu.com >/dev/null 2>&1; chk $? "DNS хоста: cloud-images.ubuntu.com"
     getent ahostsv4 raw.githubusercontent.com >/dev/null 2>&1; chk $? "DNS хоста: raw.githubusercontent.com"
     pvesm status --content snippets 2>/dev/null | awk 'NR>1{print $1}' | grep -qx local; chk $? "хранилище local умеет snippets"
@@ -1291,6 +1363,7 @@ mkdir -p "$PCS_DIR" "$PCS_LOG_DIR"
 chmod 700 "$PCS_DIR" 2>/dev/null
 : > "$PCS_LOG"; chmod 600 "$PCS_LOG"
 _logfile "pcs v${VERSION} запущен"
+ssh_setup
 
 case "${1:-}" in
     -h|--help|help)
