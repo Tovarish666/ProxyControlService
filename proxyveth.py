@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ProxyVeth v3.2
+ProxyVeth v3.3
 SOCKS5 → network namespace → sing-box (tun) → veth → mp.space (source routing).
 
 Главное отличие от v2 — DNS.
@@ -101,6 +101,10 @@ SINGBOX_BIN = os.getenv("SINGBOX_BIN", "/usr/local/bin/sing-box")
 SINGBOX_VER = os.getenv("SINGBOX_VER", "1.10.0")
 SINGBOX_URL = (f"https://github.com/SagerNet/sing-box/releases/download/"
                f"v{SINGBOX_VER}/sing-box-{SINGBOX_VER}-linux-amd64.tar.gz")
+# Лог sing-box на каждый namespace. Без него причина «tun не поднялся»
+# не видна вообще: раньше вывод уходил в /dev/null, а конфиг после неудачи
+# удалялся — диагностировать было нечем.
+SINGBOX_LOG_LEVEL = os.getenv("SINGBOX_LOG_LEVEL", "warn")
 
 # ── Сеть ────────────────────────────────────────────────────────────────────
 # Резолвер для namespace. Ходит ЧЕРЕЗ туннель, отвечает sing-box (TCP к нему же).
@@ -113,7 +117,7 @@ NS_DNS_ALT = os.getenv("NS_DNS_ALT", "8.8.8.8")
 VETH_PREFIX = os.getenv("VETH_PREFIX", "eth")
 NS_IFACE = os.getenv("NS_IFACE", "eth0")
 RT_TABLE_BASE = int(os.getenv("RT_TABLE_BASE", "100"))
-TUN_TIMEOUT = int(os.getenv("TUN_TIMEOUT", "15"))
+TUN_TIMEOUT = int(os.getenv("TUN_TIMEOUT", "20"))
 CURL_TIMEOUT = int(os.getenv("CURL_TIMEOUT", "10"))
 WORKERS = int(os.getenv("PROXYVETH_WORKERS", "8"))
 N_MIN, N_MAX = 1, 200
@@ -612,7 +616,8 @@ def singbox_config(n, modem, proxy_ip):
         долгие таймауты на каждом соединении.
     """
     return {
-        "log": {"disabled": True},
+        "log": {"disabled": False, "level": SINGBOX_LOG_LEVEL,
+                "output": str(singbox_log_path(n)), "timestamp": True},
         "dns": {
             "servers": [
                 {"tag": "remote", "address": f"tcp://{NS_DNS}", "detour": "proxy"},
@@ -659,6 +664,18 @@ def singbox_config(n, modem, proxy_ip):
 
 def singbox_conf_path(n):
     return SINGBOX_CONF_DIR / f"modem_{n}.json"
+
+
+def singbox_log_path(n):
+    return LOG_DIR / f"singbox_{n}.log"
+
+
+def singbox_log_tail(n, lines=4):
+    try:
+        rows = singbox_log_path(n).read_text(errors="replace").strip().splitlines()
+    except OSError:
+        return ""
+    return " | ".join(r.strip() for r in rows[-lines:] if r.strip())
 
 
 def singbox_pidfile(n):
@@ -821,10 +838,17 @@ def ns_up(n, modem, verbose=True):
         conf = singbox_config(n, modem, proxy_ip)
         conf_path = singbox_conf_path(n)
         _write_private(conf_path, json.dumps(conf, indent=2))
+        singbox_log_path(n).unlink(missing_ok=True)   # лог только текущей попытки
         pid = singbox_start(n, conf_path)
         if not wait_tun(n, pid):
-            raise RuntimeError(f"tun{n} не поднялся за {TUN_TIMEOUT}с "
-                               f"(проверь: {SINGBOX_BIN} check -c {conf_path})")
+            # Сообщение должно быть самодостаточным: конфиг ниже удалит ns_down,
+            # и «проверь файл X» станет бесполезным советом.
+            tail = singbox_log_tail(n)
+            chk = shq([SINGBOX_BIN, "check", "-c", str(conf_path)], timeout=15)
+            reason = tail or (chk.stderr or chk.stdout).strip().replace("\n", " ")
+            raise RuntimeError(f"tun{n} не поднялся за {TUN_TIMEOUT}с"
+                               + (f" — sing-box: {reason[:300]}" if reason
+                                  else " (sing-box молчит, лог пуст)"))
         if verbose:
             log_step(f"ns_{n}: sing-box OK (pid {pid})")
 
@@ -1329,7 +1353,7 @@ def cmd_autosync():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  install / init / cleanup / rescue / doctor
+#  install / init / cleanup / doctor
 # ════════════════════════════════════════════════════════════════════════════
 def _apt(args):
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
@@ -1645,7 +1669,7 @@ def cmd_show_config():
 # ════════════════════════════════════════════════════════════════════════════
 #  main
 # ════════════════════════════════════════════════════════════════════════════
-USAGE = f"""{B}ProxyVeth v3.2{R}
+USAGE = f"""{B}ProxyVeth v3.3{R}
 
   proxyveth sync                 обновить config.json из источника
   proxyveth autosync             sync + применить разницу (add/remove/restart)
