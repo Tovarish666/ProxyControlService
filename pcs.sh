@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-#  pcs — Proxy Control Service  v2.1
+#  pcs — Proxy Control Service  v2.2
 #  https://github.com/Tovarish666/ProxyControlService
 #
 #  Запуск: bash <(curl -s https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main/pcs.sh)
@@ -26,7 +26,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-VERSION="2.1"
+VERSION="2.2"
 GITHUB_RAW="https://raw.githubusercontent.com/Tovarish666/ProxyControlService/main"
 PROXYVETH_URL="${GITHUB_RAW}/proxyveth.py"
 SELF_URL="${GITHUB_RAW}/pcs.sh"
@@ -892,7 +892,13 @@ st_proxyveth() {
     if [[ -n "${SHEET_CSV_URL:-}" ]]; then
         step "sync + up all..."
         vm_ssh "proxyveth sync && proxyveth up all" 2>&1 | tee -a "$PCS_LOG" | tail -20 | sed 's/^/    /'
-        vm_ssh "systemctl start proxyveth-watchdog.service proxyveth-autosync.timer" || true
+        # proxyveth.service тоже стартуем: без него юнит числится inactive,
+        # даже когда namespace подняты руками, и дашборд врёт.
+        vm_ssh "systemctl start proxyveth.service proxyveth-watchdog.service proxyveth-autosync.timer" || true
+
+        step "Проверяем, что трафик реально идёт через модемы..."
+        vm_ssh "proxyveth status --wan 2>/dev/null | tail -6" 2>&1 | sed 's/^/    /' || true
+        info "Подняться ≠ работать. Если WAN пуст — proxyveth check N"
     else
         warn "Источник не задан — namespace не поднимались (Настройка → URL таблицы)"
     fi
@@ -1201,31 +1207,47 @@ self_install() {
 DASH_CACHE=""; DASH_CACHE_TS=0
 show_dashboard() {
     load_state
-    local vm_status="нет ВМ" vm_dot="${D}●${R}" st_mp="—" st_pv="—" wan="—"
+    local vm_status="нет ВМ" vm_dot="${D}●${R}" st_mp="—" wan="—"
+    local ns_cnt="" sb_cnt=""
     if [[ -n "${VM_ID:-}" ]]; then
         if vm_running; then
             vm_status="running"; vm_dot="${G}●${R}"
             local now; now=$(date +%s)
             # опрос ВМ кэшируем: в v1 каждая перерисовка меню = SSH + внешний HTTP
+            #
+            # Спрашиваем РЕАЛЬНОЕ состояние, а не `systemctl is-active proxyveth`:
+            # namespace можно поднять руками, и тогда юнит показывает inactive,
+            # хотя всё работает. Считаем namespace и процессы sing-box.
             if (( now - DASH_CACHE_TS > 20 )); then
-                DASH_CACHE=$(vm_ssh "printf '%s|%s|%s' \
+                DASH_CACHE=$(vm_ssh "printf '%s|%s|%s|%s' \
                     \"\$(systemctl is-active mproxy 2>/dev/null || echo inactive)\" \
-                    \"\$(systemctl is-active proxyveth 2>/dev/null || echo inactive)\" \
-                    \"\$(curl -s -4 --max-time 4 http://ip-api.com/line/?fields=query 2>/dev/null | head -1)\"" 2>/dev/null)
+                    \"\$(ip netns list 2>/dev/null | grep -c '^ns_')\" \
+                    \"\$(pgrep -cf 'sing-box run -c' 2>/dev/null)\" \
+                    \"\$(curl -s -4 --max-time 8 'http://ip-api.com/line/?fields=query' 2>/dev/null | head -1)\"" 2>/dev/null)
                 DASH_CACHE_TS=$now
             fi
             if [[ -n "$DASH_CACHE" ]]; then
-                IFS='|' read -r st_mp st_pv wan <<<"$DASH_CACHE"
+                IFS='|' read -r st_mp ns_cnt sb_cnt wan <<<"$DASH_CACHE"
             fi
         else
             vm_status="stopped"; vm_dot="${RD}●${R}"
         fi
     fi
-    local dot_mp dot_pv
+    [[ "${ns_cnt:-}" =~ ^[0-9]+$ ]] || ns_cnt=""
+    [[ "${sb_cnt:-}" =~ ^[0-9]+$ ]] || sb_cnt=0
+
+    local dot_mp dot_pv pv_txt
     [[ "$st_mp" == "active" ]] && dot_mp="${G}●${R}" || dot_mp="${RD}●${R}"
-    [[ "$st_pv" == "active" ]] && dot_pv="${G}●${R}" || dot_pv="${RD}●${R}"
-    [[ "$st_mp" == "—" ]] && dot_mp="${D}●${R}"
-    [[ "$st_pv" == "—" ]] && dot_pv="${D}●${R}"
+    [[ "$st_mp" == "—" || -z "$st_mp" ]] && dot_mp="${D}●${R}"
+    if [[ -z "$ns_cnt" ]]; then
+        dot_pv="${D}●${R}"; pv_txt="—"
+    elif (( ns_cnt == 0 )); then
+        dot_pv="${RD}●${R}"; pv_txt="ни одного namespace"
+    elif (( sb_cnt >= ns_cnt )); then
+        dot_pv="${G}●${R}"; pv_txt="${ns_cnt} NS / sing-box ${sb_cnt}"
+    else
+        dot_pv="${Y}●${R}"; pv_txt="${ns_cnt} NS / sing-box ${sb_cnt} — часть мертва"
+    fi
 
     printf '\n  %s┌────────────────────────────────────────────────┐%s\n' "$B" "$R"
     printf   '  %s│  pcs v%-4s — Proxy Control Service              │%s\n' "$B" "$VERSION" "$R"
@@ -1237,7 +1259,7 @@ show_dashboard() {
         printf '  %sВМ не выбрана — [v] Выбрать ВМ%s\n' "$D" "$R"
     fi
     printf '  mp.space:   %s %s\n' "$dot_mp" "$st_mp"
-    printf '  ProxyVeth:  %s %s\n' "$dot_pv" "$st_pv"
+    printf '  ProxyVeth:  %s %s\n' "$dot_pv" "$pv_txt"
     echo ""
 }
 
